@@ -1,0 +1,13 @@
+{
+  "manifestVersion": 1,
+  "tools": [
+    {
+      "toolId": "doctor",
+      "name": "Doctor",
+      "description": "Checks OS/RAM/disk, Bepoz registry, and local SQL connectivity.",
+      "toolVersion": "1.0.0",
+      "packageType": "repo",
+      "entryPoint": "tools/doctor/run.ps1"
+    }
+  ]
+}

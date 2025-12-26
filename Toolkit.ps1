@@ -21,6 +21,51 @@ $LogsDir   = Join-Path $Root "logs"
 $TempDir   = Join-Path $Root "temp"
 
 $ManifestUrl = "https://raw.githubusercontent.com/$RepoOwner/$RepoName/$Branch/manifest.json"
+
+# --- Cache / housekeeping ---
+$CatalogueDir = Join-Path $Root "catalogue"
+$TempDir      = Join-Path $Root "temp"
+$RunsDir      = Join-Path $Root "runs"
+
+New-Item -ItemType Directory -Force -Path $CatalogueDir,$TempDir,$RunsDir | Out-Null
+
+function Clear-ToolkitCache {
+  param(
+    [switch]$OnOpen,
+    [switch]$OnClose,
+    [int]$PruneRunsOlderThanDays = 30
+  )
+
+  Write-Host ("[Cache] Clearing cache ({0})..." -f ($(if($OnOpen){"open"}elseif($OnClose){"close"}else{"manual"})))
+
+  # 1) Force fresh manifest on next refresh
+  $manifestPath = Join-Path $CatalogueDir "manifest.json"
+  if (Test-Path $manifestPath) {
+    Remove-Item -Force $manifestPath -ErrorAction SilentlyContinue
+    Write-Host "[Cache] Deleted cached manifest.json"
+  }
+
+  # 2) Clear temp downloads
+  if (Test-Path $TempDir) {
+    Get-ChildItem -Path $TempDir -Force -ErrorAction SilentlyContinue | Remove-Item -Force -Recurse -ErrorAction SilentlyContinue
+    Write-Host "[Cache] Cleared temp folder"
+  }
+
+  # 3) Optional: prune old runs, keep recent audit trail
+  if ($PruneRunsOlderThanDays -gt 0 -and (Test-Path $RunsDir)) {
+    $cutoff = (Get-Date).AddDays(-$PruneRunsOlderThanDays)
+    Get-ChildItem -Path $RunsDir -Directory -ErrorAction SilentlyContinue |
+      Where-Object { $_.LastWriteTime -lt $cutoff } |
+      ForEach-Object {
+        try {
+          Remove-Item -LiteralPath $_.FullName -Force -Recurse -ErrorAction Stop
+          Write-Host "[Cache] Pruned old run: $($_.Name)"
+        } catch {
+          Write-Host "[Cache] Could not prune $($_.Name): $($_.Exception.Message)"
+        }
+      }
+  }
+}
 # ----------------------------------------
 
 function Ensure-Tls12 {

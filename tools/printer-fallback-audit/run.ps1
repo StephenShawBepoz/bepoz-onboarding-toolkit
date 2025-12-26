@@ -37,7 +37,6 @@ function Write-Report {
         Out ""
         Out "Report written: $($script:Report.reportPath)"
     } catch {
-        # last resort - do not throw
         Out "WARN: Failed to write Report.json: $($_.Exception.Message)"
     }
 }
@@ -230,6 +229,39 @@ function Show-ConfirmFixDialog {
 }
 
 # -------------------------
+# DataTable normaliser (fixes Object[] / DataSet.Tables / DataRow[] issues)
+# -------------------------
+function Ensure-DataTable {
+    param([object]$Value)
+
+    if ($null -eq $Value) {
+        throw "Expected DataTable but got: <null>"
+    }
+
+    if ($Value -is [System.Data.DataTable]) { return $Value }
+
+    # DataSet -> first table
+    if ($Value -is [System.Data.DataSet]) {
+        if ($Value.Tables.Count -gt 0) { return $Value.Tables[0] }
+        throw "Expected DataTable but got DataSet with 0 tables."
+    }
+
+    # Object[] that might contain DataTables or DataRows
+    if ($Value -is [System.Array] -and $Value.Count -gt 0) {
+
+        if ($Value[0] -is [System.Data.DataTable]) { return $Value[0] }
+
+        if ($Value[0] -is [System.Data.DataRow]) {
+            $t = $Value[0].Table.Clone()
+            foreach ($r in $Value) { [void]$t.ImportRow($r) }
+            return $t
+        }
+    }
+
+    throw "Expected DataTable but got: $($Value.GetType().FullName)"
+}
+
+# -------------------------
 # SQL config from HKCU:\SOFTWARE\Backoffice
 # LOCAL SQL ONLY enforcement
 # -------------------------
@@ -278,7 +310,13 @@ function Open-SqlConnection([string]$Server, [string]$Database) {
     return $conn
 }
 
-function Invoke-Query([System.Data.SqlClient.SqlConnection]$Conn, [string]$Sql, [hashtable]$Params = $null) {
+function Invoke-Query {
+    param(
+        [Parameter(Mandatory)][System.Data.SqlClient.SqlConnection]$Conn,
+        [Parameter(Mandatory)][string]$Sql,
+        [hashtable]$Params = $null
+    )
+
     $cmd = $Conn.CreateCommand()
     $cmd.CommandText = $Sql
     $cmd.CommandTimeout = 30
@@ -290,13 +328,25 @@ function Invoke-Query([System.Data.SqlClient.SqlConnection]$Conn, [string]$Sql, 
         }
     }
 
+    # Always fill a DataSet, then return ONLY the first DataTable (prevents Object[] issues)
     $da = New-Object System.Data.SqlClient.SqlDataAdapter $cmd
-    $dt = New-Object System.Data.DataTable
-    [void]$da.Fill($dt)
-    return $dt
+    $ds = New-Object System.Data.DataSet
+    [void]$da.Fill($ds)
+
+    if ($ds.Tables.Count -eq 0) {
+        return (New-Object System.Data.DataTable)
+    }
+
+    return $ds.Tables[0]
 }
 
-function Invoke-NonQuery([System.Data.SqlClient.SqlConnection]$Conn, [string]$Sql, [hashtable]$Params = $null) {
+function Invoke-NonQuery {
+    param(
+        [Parameter(Mandatory)][System.Data.SqlClient.SqlConnection]$Conn,
+        [Parameter(Mandatory)][string]$Sql,
+        [hashtable]$Params = $null
+    )
+
     $cmd = $Conn.CreateCommand()
     $cmd.CommandText = $Sql
     $cmd.CommandTimeout = 30
@@ -311,7 +361,11 @@ function Invoke-NonQuery([System.Data.SqlClient.SqlConnection]$Conn, [string]$Sq
     return $cmd.ExecuteNonQuery()
 }
 
-function DT([System.Data.DataTable]$dt) {
+function DT {
+    param([Parameter(Mandatory)][object]$dt)
+
+    $dt = Ensure-DataTable $dt
+
     $list = @()
     foreach ($row in $dt.Rows) {
         $o = [PSCustomObject]@{}
@@ -325,7 +379,7 @@ function DT([System.Data.DataTable]$dt) {
 
 # -------------------------
 # Printer fallback audit logic
-# - Uses dbo.Device.FallbackID (per your schema sample)
+# - Uses dbo.Device.FallbackID
 # - Venue -> Store -> Workstation -> Device
 # -------------------------
 function Get-VenueList([System.Data.SqlClient.SqlConnection]$Conn) {
@@ -339,9 +393,6 @@ function Get-Venue([System.Data.SqlClient.SqlConnection]$Conn, [int]$VenueID) {
 }
 
 function Get-VenuePrintingDevices([System.Data.SqlClient.SqlConnection]$Conn, [int]$VenueID) {
-    # "Printing devices" heuristic:
-    # - Exclude DeviceType 4 (EFTPOS), 6 (Cash Drawer), 28 (KDS)
-    # - Include typical printer ports/subtypes/names
     $sql = @"
 SELECT
     v.VenueID,
@@ -388,7 +439,6 @@ ORDER BY st.Name, ws.Name, d.Name;
 function Find-Anomalies([object[]]$devices) {
     $anoms = New-Object System.Collections.Generic.List[object]
 
-    # 1) Fallback points to missing device (shouldn't happen due to LEFT JOIN, but can if broken)
     foreach ($d in $devices) {
         $fid = $d.FallbackID
         if ($fid -ne $null -and ("" + $fid).Trim() -ne "") {
@@ -404,7 +454,6 @@ function Find-Anomalies([object[]]$devices) {
         }
     }
 
-    # 2) Fallback references itself
     foreach ($d in $devices) {
         $fid = $d.FallbackID
         if ($fid -ne $null -and ("" + $fid).Trim() -ne "") {
@@ -420,7 +469,6 @@ function Find-Anomalies([object[]]$devices) {
         }
     }
 
-    # 3) Disabled device with fallback (not necessarily wrong, but suspicious)
     foreach ($d in $devices) {
         if ([int]$d.Disabled -eq 1) {
             $fid = $d.FallbackID
@@ -442,9 +490,7 @@ function Find-Anomalies([object[]]$devices) {
 # -------------------------
 # Optional Fix (safe + limited)
 # v1 fix policy:
-# - Only offers auto-fix for SelfFallback and MissingFallbackDevice:
-#   -> sets FallbackID = NULL
-# - Does NOT attempt to "choose" a fallback printer automatically.
+# - Only clears invalid/self fallback IDs: sets FallbackID = NULL
 # -------------------------
 function Apply-Fix([System.Data.SqlClient.SqlConnection]$Conn, [int]$VenueID, [object[]]$devices, [object[]]$anomalies) {
     $script:Report.results.fix.attempted = $true
@@ -499,7 +545,6 @@ To proceed, tick the checkbox and type YES.
         $sql = "UPDATE dbo.Device SET FallbackID = NULL WHERE DeviceID = @DeviceID;"
         $affected = Invoke-NonQuery -Conn $Conn -Sql $sql -Params @{ DeviceID = $deviceId }
 
-        # After snapshot
         $dtAfter = Invoke-Query -Conn $Conn -Sql "SELECT d.DeviceID, d.Name AS DeviceName, d.FallbackID, fb.Name AS FallbackDeviceName FROM dbo.Device d LEFT JOIN dbo.Device fb ON fb.DeviceID = d.FallbackID WHERE d.DeviceID = @DeviceID;" -Params @{ DeviceID = $deviceId }
         $afterObj = (DT $dtAfter | Select-Object -First 1)
 
@@ -537,7 +582,6 @@ try {
     $conn = Open-SqlConnection -Server $cfg.Server -Database $cfg.Database
     Out "Connected."
 
-    # Venue prompt (GUI)
     $venues = Get-VenueList -Conn $conn
     if (-not $venues -or $venues.Count -eq 0) { Fail "No venues found in dbo.Venue." 6 }
 
@@ -560,7 +604,6 @@ try {
 
     $devices = Get-VenuePrintingDevices -Conn $conn -VenueID $venueId
 
-    # Counts
     $script:Report.results.counts.printers = ($devices | Measure-Object).Count
     $withFallback = ($devices | Where-Object { $_.FallbackID -ne $null -and (""+$_.FallbackID).Trim() -ne "" }).Count
     $withoutFallback = $script:Report.results.counts.printers - $withFallback
@@ -570,12 +613,10 @@ try {
     $script:Report.results.counts.withoutFallback = $withoutFallback
     $script:Report.results.counts.disabled = $disabled
 
-    # Anomalies
     $anoms = Find-Anomalies -devices $devices
     $script:Report.results.anomalies = @($anoms)
     $script:Report.results.counts.anomalies = ($anoms | Measure-Object).Count
 
-    # Save devices
     $script:Report.results.printers = @(
         $devices | ForEach-Object {
             [ordered]@{
@@ -595,7 +636,6 @@ try {
         }
     )
 
-    # Output summary
     Out "Summary"
     Out "  Printers found:        $($script:Report.results.counts.printers)"
     Out "  With fallback:         $withFallback"
@@ -630,7 +670,6 @@ try {
         Out ""
     }
 
-    # Optional Apply Fix mode (GUI confirm) — safe, limited v1
     Apply-Fix -Conn $conn -VenueID $venueId -devices $devices -anomalies $anoms
 
     $script:Report.status = "success"

@@ -105,17 +105,20 @@ function Clear-ToolkitCache {
 
   Write-Host ("[Cache] Clearing cache ({0})..." -f ($(if($OnOpen){"open"}elseif($OnClose){"close"}else{"manual"})))
 
+  # Force fresh manifest on next refresh
   $manifestPath = Join-Path $CatDir "manifest.json"
   if (Test-Path $manifestPath) {
     Remove-Item -Force $manifestPath -ErrorAction SilentlyContinue
     Write-Host "[Cache] Deleted cached manifest.json"
   }
 
+  # Clear temp downloads
   if (Test-Path $TempDir) {
     Get-ChildItem -Path $TempDir -Force -ErrorAction SilentlyContinue | Remove-Item -Force -Recurse -ErrorAction SilentlyContinue
     Write-Host "[Cache] Cleared temp folder"
   }
 
+  # Optional: prune old runs
   if ($PruneRunsOlderThanDays -gt 0 -and (Test-Path $RunsDir)) {
     $cutoff = (Get-Date).AddDays(-$PruneRunsOlderThanDays)
     Get-ChildItem -Path $RunsDir -Directory -ErrorAction SilentlyContinue |
@@ -132,31 +135,87 @@ function Clear-ToolkitCache {
 }
 # -----------------------------------------------------
 
+function Start-ToolProcess([object]$tool, [string]$runDir) {
+  $toolId    = [string]$tool.toolId
+  $entryRel  = [string]$tool.entryPoint
+  $entryPath = Join-Path $Root ($entryRel -replace "/","\")
+  if (-not (Test-Path $entryPath)) { throw "EntryPoint not found on disk: $entryPath" }
+
+  $outLog = Join-Path $runDir "Output.log"
+  $runner = Join-Path $runDir "RunTool.ps1"
+
+  # This runner captures ALL output (including Write-Host) via transcript,
+  # and runs in STA so WinForms dialogs can display.
+@"
+`$ErrorActionPreference = 'Stop'
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+
+`$runDir = '$runDir'
+`$outLog = '$outLog'
+`$env:BEPoz_TOOLKIT_RUNDIR = `$runDir
+
+New-Item -ItemType Directory -Force -Path `$runDir | Out-Null
+
+try {
+  Start-Transcript -Path `$outLog -Append | Out-Null
+} catch {}
+
+Push-Location '$Root'
+try {
+  Write-Host "Running tool: $toolId"
+  Write-Host "EntryPoint:   $entryRel"
+  Write-Host "RunDir:       `$runDir"
+  & '$entryPath' -RunDir `$runDir
+  exit `$LASTEXITCODE
+} catch {
+  Write-Host "ERROR: $($_.Exception.Message)"
+  Write-Host $_.ScriptStackTrace
+  exit 1
+} finally {
+  Pop-Location
+  try { Stop-Transcript | Out-Null } catch {}
+}
+"@ | Set-Content -Path $runner -Encoding UTF8
+
+  $psi = New-Object System.Diagnostics.ProcessStartInfo
+  $psi.FileName = "powershell.exe"
+  $psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -STA -File `"$runner`""
+  $psi.WorkingDirectory = $Root
+  $psi.UseShellExecute = $false
+  $psi.CreateNoWindow = $true
+
+  $p = [System.Diagnostics.Process]::Start($psi)
+
+  # Metadata (written immediately)
+  $meta = @{
+    toolId     = $toolId
+    toolName   = [string]$tool.name
+    startedAt  = (Get-Date).ToString("o")
+    runDir     = $runDir
+    outputLog  = $outLog
+    entryPoint = $entryRel
+    processId  = $p.Id
+  } | ConvertTo-Json -Depth 6
+
+  $metaPath = Join-Path $runDir "ToolkitRun.json"
+  $meta | Set-Content -Path $metaPath -Encoding UTF8
+
+  return $p
+}
+
 function Run-ToolConsole([string]$toolId) {
   $m = Load-Manifest
   $t = Get-Tool -manifest $m -toolId $toolId
   Ensure-ToolInstalled -tool $t
 
   $runDir = New-RunDir -toolId $toolId
-  $outLog = Join-Path $runDir "Output.log"
-  $runner = Join-Path $runDir "RunTool.ps1"
-
-  @"
-`$ErrorActionPreference = 'Stop'
-`$runDir = '$runDir'
-`$env:BEPoz_TOOLKIT_RUNDIR = `$runDir
-Push-Location '$Root'
-try {
-  & '$(Join-Path $Root ($t.entryPoint -replace "/","\"))' -RunDir `$runDir *>> '$outLog'
-  exit `$LASTEXITCODE
-} finally { Pop-Location }
-"@ | Set-Content -Path $runner -Encoding UTF8
-
   Write-Host "RunDir: $runDir"
-  $p = Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile -ExecutionPolicy Bypass -STA -File `"$runner`"" -WorkingDirectory $Root -PassThru
+
+  $p = Start-ToolProcess -tool $t -runDir $runDir
   $p.WaitForExit()
+
   Write-Host "ExitCode: $($p.ExitCode)"
-  Write-Host "Output:  $outLog"
+  Write-Host "Output:   $(Join-Path $runDir 'Output.log')"
 }
 
 function Show-Ui {
@@ -318,8 +377,8 @@ function Show-Ui {
     $t = $toolMap[$sel]
     $lblName.Text = "{0}" -f $t.name
     $txtDesc.Text = "{0}`r`n`r`nToolId: {1}    Version: {2}`r`nEntryPoint: {3}" -f $t.description, $t.toolId, $t.toolVersion, $t.entryPoint
-
     $infoBox.Text = ($t | ConvertTo-Json -Depth 8)
+
     $outBox.Clear()
     $currentOutLog = $null
     $lastOutLen = 0
@@ -337,28 +396,14 @@ function Show-Ui {
       Ensure-ToolInstalled -tool $t
 
       $runDir = New-RunDir -toolId $t.toolId
-      $outLog = Join-Path $runDir "Output.log"
-      $currentOutLog = $outLog
+      $currentOutLog = Join-Path $runDir "Output.log"
       $lastOutLen = 0
 
       $outBox.Text = "Running $($t.toolId)...`r`nRunDir: $runDir`r`n"
       $timer.Start()
 
-      $runner = Join-Path $runDir "RunTool.ps1"
-      @"
-`$ErrorActionPreference = 'Stop'
-`$runDir = '$runDir'
-`$env:BEPoz_TOOLKIT_RUNDIR = `$runDir
-Push-Location '$Root'
-try {
-  & '$(Join-Path $Root ($t.entryPoint -replace "/","\"))' -RunDir `$runDir *>> '$outLog'
-  exit `$LASTEXITCODE
-} finally { Pop-Location }
-"@ | Set-Content -Path $runner -Encoding UTF8
-
-      # IMPORTANT: -STA so WinForms dialogs (InputBox/MessageBox/etc) can display
-      # IMPORTANT: WindowStyle Normal so you don't lose dialogs behind hidden windows
-      Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile -ExecutionPolicy Bypass -STA -File `"$runner`"" -WorkingDirectory $Root -WindowStyle Normal | Out-Null
+      # Start tool detached (STA, no console window)
+      $null = Start-ToolProcess -tool $t -runDir $runDir
 
     } catch {
       $timer.Stop()
@@ -375,11 +420,24 @@ Ensure-Dirs
 
 try {
   switch ($Command) {
-    "init" { Write-Host "Initialised: $Root" }
-    "sync" { $null = Load-Manifest; Write-Host "Synced manifest to: $(Join-Path $CatDir 'manifest.json')" }
-    "list" { $m = Load-Manifest; $m.tools | ForEach-Object { $_.toolId } }
-    "run"  { if (-not $ToolId) { throw "Use: -Command run -ToolId <id>" }; Run-ToolConsole -toolId $ToolId }
-    default { Show-Ui }
+    "init" {
+      Write-Host "Initialised: $Root"
+    }
+    "sync" {
+      $null = Load-Manifest
+      Write-Host "Synced manifest to: $(Join-Path $CatDir 'manifest.json')"
+    }
+    "list" {
+      $m = Load-Manifest
+      $m.tools | ForEach-Object { $_.toolId }
+    }
+    "run" {
+      if (-not $ToolId) { throw "Use: -Command run -ToolId <id>" }
+      Run-ToolConsole -toolId $ToolId
+    }
+    default {
+      Show-Ui
+    }
   }
 }
 catch {

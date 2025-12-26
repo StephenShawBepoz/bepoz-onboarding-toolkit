@@ -8,13 +8,14 @@
       "toolVersion": "1.0.0",
       "packageType": "repo",
       "entryPoint": "tools/doctor/run.ps1"
+    },
+    {
+      "toolId": "printer-fallback-audit",
+      "name": "Printer Fallback Audit",
+      "description": "Audit printing devices in a venue and report/set fallback devices (with explicit confirmation).",
+      "toolVersion": "1.0.0",
+      "packageType": "repo",
+      "entryPoint": "tools/printer-fallback-audit/run.ps1"
     }
   ]
-}
-{
-  "toolId": "printer-fallback-audit",
-  "name": "Printer Fallback Audit",
-  "description": "Audit printing devices in a venue and report/set fallback devices (with explicit confirmation).",
-  "toolVersion": "1.0.0",
-  "entryPoint": "tools/printer-fallback-audit/run.ps1"
 }

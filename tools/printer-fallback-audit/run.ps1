@@ -3,10 +3,10 @@ param([string]$RunDir)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# -------------------------
-# Helpers: Output + Report
-# -------------------------
-function Out([string]$msg) { Write-Host $msg }
+# =========================
+# Toolkit scaffolding
+# =========================
+function Out([string]$m) { Write-Host $m }
 
 $script:Report = [ordered]@{
     toolId      = "printer-fallback-audit"
@@ -15,15 +15,14 @@ $script:Report = [ordered]@{
     status      = "running"
     runDir      = $null
     reportPath  = $null
-    warnings    = @()
-    sql         = [ordered]@{ SQL_Server = $null; SQL_DSN = $null; LocalSqlOnlyVerified = $false }
     inputs      = [ordered]@{ VenueID = $null; ApplyFix = $false }
+    sql         = [ordered]@{ SQL_Server = $null; SQL_DSN = $null; LocalSqlOnlyVerified = $false }
     results     = [ordered]@{
-        venue      = $null
-        printers   = @()
-        counts     = [ordered]@{ printers = 0; withFallback = 0; withoutFallback = 0; disabled = 0; anomalies = 0 }
-        anomalies  = @()
-        fix        = [ordered]@{ supported = $true; attempted = $false; applied = $false; reason = $null; beforeAfter = @() }
+        venue     = $null
+        printers  = @()
+        counts    = [ordered]@{ printers = 0; withFallback = 0; withoutFallback = 0; anomalies = 0 }
+        anomalies = @()
+        fix       = [ordered]@{ attempted = $false; applied = $false; reason = $null; beforeAfter = @() }
     }
     finishedUtc = $null
     error       = $null
@@ -32,8 +31,7 @@ $script:Report = [ordered]@{
 function Write-Report {
     try {
         $script:Report.finishedUtc = [DateTime]::UtcNow.ToString("o")
-        $json = $script:Report | ConvertTo-Json -Depth 30
-        $json | Out-File -LiteralPath $script:Report.reportPath -Encoding UTF8 -Force
+        ($script:Report | ConvertTo-Json -Depth 40) | Out-File -LiteralPath $script:Report.reportPath -Encoding UTF8 -Force
         Out ""
         Out "Report written: $($script:Report.reportPath)"
     } catch {
@@ -56,59 +54,20 @@ function Succeed {
     exit 0
 }
 
-# -------------------------
-# RunDir rules
-# -------------------------
 try {
     if ([string]::IsNullOrWhiteSpace($RunDir)) { $RunDir = $env:BEPoz_TOOLKIT_RUNDIR }
-    if ([string]::IsNullOrWhiteSpace($RunDir)) { Fail "RunDir was not provided and BEPoz_TOOLKIT_RUNDIR is not set." 2 }
+    if ([string]::IsNullOrWhiteSpace($RunDir)) { Fail "RunDir missing. Provide param RunDir or set BEPoz_TOOLKIT_RUNDIR." 2 }
 
-    if (-not (Test-Path -LiteralPath $RunDir)) {
-        New-Item -Path $RunDir -ItemType Directory -Force | Out-Null
-    }
+    if (-not (Test-Path -LiteralPath $RunDir)) { New-Item -Path $RunDir -ItemType Directory -Force | Out-Null }
     $script:Report.runDir = (Resolve-Path -LiteralPath $RunDir).Path
     $script:Report.reportPath = Join-Path $script:Report.runDir "Report.json"
 } catch {
     Fail "Failed to initialise RunDir: $($_.Exception.Message)" 2
 }
 
-# -------------------------
-# Must run from C:\Bepoz\OnboardingToolkit (warn only)
-# -------------------------
-try {
-    $expectedRoot = "C:\Bepoz\OnboardingToolkit"
-    if ($PSScriptRoot -and ($PSScriptRoot -notlike "$expectedRoot*")) {
-        Out "WARN: Not running from $expectedRoot (current: $PSScriptRoot). Continuing."
-        $script:Report.warnings += "Not running from C:\Bepoz\OnboardingToolkit (current: $PSScriptRoot)."
-    }
-} catch {}
-
-# -------------------------
-# Only BackOffice / Server (not POS) heuristic
-# -------------------------
-try {
-    $programs = "C:\Bepoz\Programs"
-    $boExe  = Join-Path $programs "BackOffice.exe"
-    $posExe = Join-Path $programs "SmartPOS.exe"
-
-    $hasBO  = Test-Path -LiteralPath $boExe
-    $hasPOS = Test-Path -LiteralPath $posExe
-
-    if (-not $hasBO -and $hasPOS) {
-        Fail "This tool must run on BackOffice PCs / Servers only. Detected SmartPOS.exe without BackOffice.exe." 3
-    }
-    if (-not $hasBO -and -not $hasPOS) {
-        Out "WARN: Could not confirm BackOffice vs POS (BackOffice.exe/SmartPOS.exe not found). Continuing."
-        $script:Report.warnings += "Could not confirm BackOffice vs POS (BackOffice.exe/SmartPOS.exe not found)."
-    }
-} catch {
-    Out "WARN: BackOffice/POS heuristic check failed: $($_.Exception.Message)"
-    $script:Report.warnings += "BackOffice/POS heuristic check failed: $($_.Exception.Message)"
-}
-
-# -------------------------
-# GUI prompts (NO Read-Host)
-# -------------------------
+# =========================
+# GUI helpers (no Read-Host)
+# =========================
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -169,7 +128,7 @@ function Show-ConfirmFixDialog {
     $form = New-Object System.Windows.Forms.Form
     $form.Text = $Title
     $form.StartPosition = "CenterScreen"
-    $form.Size = New-Object System.Drawing.Size(620, 240)
+    $form.Size = New-Object System.Drawing.Size(640, 250)
     $form.FormBorderStyle = 'FixedDialog'
     $form.MaximizeBox = $false
     $form.MinimizeBox = $false
@@ -179,43 +138,40 @@ function Show-ConfirmFixDialog {
     $lbl.AutoSize = $false
     $lbl.Text = $Message
     $lbl.Location = New-Object System.Drawing.Point(12, 12)
-    $lbl.Size = New-Object System.Drawing.Size(580, 80)
+    $lbl.Size = New-Object System.Drawing.Size(600, 90)
     $form.Controls.Add($lbl)
 
     $chk = New-Object System.Windows.Forms.CheckBox
-    $chk.Text = "I understand this will change SQL data for fallback settings"
-    $chk.Location = New-Object System.Drawing.Point(12, 96)
-    $chk.Size = New-Object System.Drawing.Size(580, 22)
+    $chk.Text = "I understand this will change SQL data"
+    $chk.Location = New-Object System.Drawing.Point(12, 108)
+    $chk.Size = New-Object System.Drawing.Size(600, 22)
     $form.Controls.Add($chk)
 
     $lblYes = New-Object System.Windows.Forms.Label
-    $lblYes.AutoSize = $false
     $lblYes.Text = "Type YES to proceed:"
-    $lblYes.Location = New-Object System.Drawing.Point(12, 126)
-    $lblYes.Size = New-Object System.Drawing.Size(200, 22)
+    $lblYes.Location = New-Object System.Drawing.Point(12, 136)
+    $lblYes.Size = New-Object System.Drawing.Size(170, 22)
     $form.Controls.Add($lblYes)
 
     $txt = New-Object System.Windows.Forms.TextBox
-    $txt.Location = New-Object System.Drawing.Point(170, 126)
-    $txt.Size = New-Object System.Drawing.Size(150, 22)
+    $txt.Location = New-Object System.Drawing.Point(170, 136)
+    $txt.Size = New-Object System.Drawing.Size(160, 22)
     $form.Controls.Add($txt)
 
     $ok = New-Object System.Windows.Forms.Button
     $ok.Text = "Apply Fix"
-    $ok.Location = New-Object System.Drawing.Point(402, 160)
+    $ok.Location = New-Object System.Drawing.Point(420, 170)
     $ok.Enabled = $false
     $form.Controls.Add($ok)
 
     $cancel = New-Object System.Windows.Forms.Button
     $cancel.Text = "Cancel"
-    $cancel.Location = New-Object System.Drawing.Point(502, 160)
+    $cancel.Location = New-Object System.Drawing.Point(520, 170)
     $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
     $form.CancelButton = $cancel
     $form.Controls.Add($cancel)
 
-    $handler = {
-        $ok.Enabled = ($chk.Checked -and ($txt.Text.Trim().ToUpperInvariant() -eq "YES"))
-    }
+    $handler = { $ok.Enabled = ($chk.Checked -and ($txt.Text.Trim().ToUpperInvariant() -eq "YES")) }
     $chk.add_CheckedChanged($handler)
     $txt.add_TextChanged($handler)
 
@@ -224,31 +180,25 @@ function Show-ConfirmFixDialog {
         $form.Close()
     })
 
-    $result = $form.ShowDialog()
-    return ($result -eq [System.Windows.Forms.DialogResult]::OK)
+    return ($form.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK)
 }
 
-# -------------------------
-# DataTable normaliser (fixes Object[] / DataSet.Tables / DataRow[] issues)
-# -------------------------
+# =========================
+# DataTable normaliser (THIS is the fix)
+# =========================
 function Ensure-DataTable {
     param([object]$Value)
 
-    if ($null -eq $Value) {
-        throw "Expected DataTable but got: <null>"
-    }
+    if ($null -eq $Value) { throw "Expected DataTable but got: <null>" }
 
     if ($Value -is [System.Data.DataTable]) { return $Value }
 
-    # DataSet -> first table
     if ($Value -is [System.Data.DataSet]) {
         if ($Value.Tables.Count -gt 0) { return $Value.Tables[0] }
         throw "Expected DataTable but got DataSet with 0 tables."
     }
 
-    # Object[] that might contain DataTables or DataRows
     if ($Value -is [System.Array] -and $Value.Count -gt 0) {
-
         if ($Value[0] -is [System.Data.DataTable]) { return $Value[0] }
 
         if ($Value[0] -is [System.Data.DataRow]) {
@@ -261,10 +211,26 @@ function Ensure-DataTable {
     throw "Expected DataTable but got: $($Value.GetType().FullName)"
 }
 
-# -------------------------
-# SQL config from HKCU:\SOFTWARE\Backoffice
-# LOCAL SQL ONLY enforcement
-# -------------------------
+function DataTable-ToObjects {
+    param([Parameter(Mandatory)][object]$dt)
+
+    # Normalise anything (DataSet/DataTable/Object[]/DataRow[]) into a DataTable
+    $dt = Ensure-DataTable $dt
+
+    $list = @()
+    foreach ($row in $dt.Rows) {
+        $o = [PSCustomObject]@{}
+        foreach ($col in $dt.Columns) {
+            $o | Add-Member -NotePropertyName $col.ColumnName -NotePropertyValue $row[$col.ColumnName]
+        }
+        $list += $o
+    }
+    return $list
+}
+
+# =========================
+# SQL config from HKCU + local-only enforcement
+# =========================
 function Get-SqlConfig {
     $key = "HKCU:\SOFTWARE\Backoffice"
     if (-not (Test-Path -LiteralPath $key)) { Fail "Registry key not found: $key" 4 }
@@ -279,11 +245,11 @@ function Get-SqlConfig {
     $script:Report.sql.SQL_Server = $server
     $script:Report.sql.SQL_DSN    = $db
 
-    Out "SQL config:"
+    Out "SQL config from registry:"
     Out "  SQL_Server = $server"
     Out "  SQL_DSN    = $db"
+    Out ""
 
-    # Local-only: validate host portion
     $hostPart = $server
     if ($hostPart.Contains("\")) { $hostPart = $hostPart.Split("\")[0] }
     $hostPart = $hostPart.Trim()
@@ -310,7 +276,7 @@ function Open-SqlConnection([string]$Server, [string]$Database) {
     return $conn
 }
 
-function Invoke-Query {
+function Invoke-SqlQuery {
     param(
         [Parameter(Mandatory)][System.Data.SqlClient.SqlConnection]$Conn,
         [Parameter(Mandatory)][string]$Sql,
@@ -328,19 +294,16 @@ function Invoke-Query {
         }
     }
 
-    # Always fill a DataSet, then return ONLY the first DataTable (prevents Object[] issues)
     $da = New-Object System.Data.SqlClient.SqlDataAdapter $cmd
     $ds = New-Object System.Data.DataSet
     [void]$da.Fill($ds)
 
-    if ($ds.Tables.Count -eq 0) {
-        return (New-Object System.Data.DataTable)
-    }
-
+    # IMPORTANT: return only ONE DataTable, not the whole Tables collection
+    if ($ds.Tables.Count -eq 0) { return (New-Object System.Data.DataTable) }
     return $ds.Tables[0]
 }
 
-function Invoke-NonQuery {
+function Invoke-SqlNonQuery {
     param(
         [Parameter(Mandatory)][System.Data.SqlClient.SqlConnection]$Conn,
         [Parameter(Mandatory)][string]$Sql,
@@ -361,38 +324,16 @@ function Invoke-NonQuery {
     return $cmd.ExecuteNonQuery()
 }
 
-function DT {
-    param([Parameter(Mandatory)][object]$dt)
-
-    $dt = Ensure-DataTable $dt
-
-    $list = @()
-    foreach ($row in $dt.Rows) {
-        $o = [PSCustomObject]@{}
-        foreach ($col in $dt.Columns) {
-            $o | Add-Member -NotePropertyName $col.ColumnName -NotePropertyValue $row[$col.ColumnName]
-        }
-        $list += $o
-    }
-    return $list
-}
-
-# -------------------------
-# Printer fallback audit logic
-# - Uses dbo.Device.FallbackID
-# - Venue -> Store -> Workstation -> Device
-# -------------------------
-function Get-VenueList([System.Data.SqlClient.SqlConnection]$Conn) {
-    $dt = Invoke-Query -Conn $Conn -Sql "SELECT VenueID, Name FROM dbo.Venue ORDER BY Name;"
-    return (DT $dt)
-}
-
+# =========================
+# Audit queries
+# =========================
 function Get-Venue([System.Data.SqlClient.SqlConnection]$Conn, [int]$VenueID) {
-    $dt = Invoke-Query -Conn $Conn -Sql "SELECT VenueID, Name FROM dbo.Venue WHERE VenueID = @VenueID;" -Params @{ VenueID = $VenueID }
-    return ((DT $dt) | Select-Object -First 1)
+    $dt = Invoke-SqlQuery -Conn $Conn -Sql "SELECT VenueID, Name FROM dbo.Venue WHERE VenueID = @VenueID;" -Params @{ VenueID = $VenueID }
+    return (DataTable-ToObjects $dt | Select-Object -First 1)
 }
 
 function Get-VenuePrintingDevices([System.Data.SqlClient.SqlConnection]$Conn, [int]$VenueID) {
+    # NOTE: printer identification is heuristic; we can tighten once you confirm real printer DeviceType/SubType values.
     $sql = @"
 SELECT
     v.VenueID,
@@ -401,7 +342,6 @@ SELECT
     st.Name AS StoreName,
     ws.WorkstationID,
     ws.Name AS WorkstationName,
-
     d.DeviceID,
     d.Name AS DeviceName,
     d.Disabled,
@@ -418,22 +358,19 @@ JOIN dbo.Workstation ws ON ws.StoreID = st.StoreID
 JOIN dbo.Device d ON d.WorkstationID = ws.WorkstationID
 LEFT JOIN dbo.Device fb ON fb.DeviceID = d.FallbackID
 WHERE v.VenueID = @VenueID
-  AND ISNULL(d.DeviceType,0) NOT IN (4,6,28)
+  AND ISNULL(d.DeviceType,0) NOT IN (4,6,28) -- exclude EFTPOS/drawers/KDS-ish based on your samples
   AND (
-        d.PortName IN ('COM1','COM2','COM3','COM4','TCP-P','WIN')
+        d.PortName IN ('TCP-P','WIN')
      OR d.PortName LIKE 'COM%'
      OR d.PortName LIKE 'TCP%'
      OR d.PortName LIKE 'WIN%'
      OR d.SubType IN (70,84,85,3005,3032)
      OR d.Name LIKE '%Printer%'
-     OR d.Name LIKE '%Expo%'
-     OR d.Name LIKE '%Grill%'
-     OR d.Name LIKE '%Pass%'
   )
 ORDER BY st.Name, ws.Name, d.Name;
 "@
-    $dt = Invoke-Query -Conn $Conn -Sql $sql -Params @{ VenueID = $VenueID }
-    return (DT $dt)
+    $dt = Invoke-SqlQuery -Conn $Conn -Sql $sql -Params @{ VenueID = $VenueID }
+    return (DataTable-ToObjects $dt)
 }
 
 function Find-Anomalies([object[]]$devices) {
@@ -441,14 +378,14 @@ function Find-Anomalies([object[]]$devices) {
 
     foreach ($d in $devices) {
         $fid = $d.FallbackID
-        if ($fid -ne $null -and ("" + $fid).Trim() -ne "") {
+        if ($fid -ne $null -and (""+$fid).Trim() -ne "") {
             if ([string]::IsNullOrWhiteSpace("" + $d.FallbackDeviceName)) {
                 $anoms.Add([ordered]@{
                     type = "MissingFallbackDevice"
                     deviceId = [int]$d.DeviceID
                     deviceName = $d.DeviceName
                     fallbackId = [int]$fid
-                    message = "FallbackID is set but fallback device name could not be resolved."
+                    message = "FallbackID set but fallback device could not be resolved (missing row?)."
                 })
             }
         }
@@ -456,7 +393,7 @@ function Find-Anomalies([object[]]$devices) {
 
     foreach ($d in $devices) {
         $fid = $d.FallbackID
-        if ($fid -ne $null -and ("" + $fid).Trim() -ne "") {
+        if ($fid -ne $null -and (""+$fid).Trim() -ne "") {
             if ([int]$d.DeviceID -eq [int]$fid) {
                 $anoms.Add([ordered]@{
                     type = "SelfFallback"
@@ -469,66 +406,36 @@ function Find-Anomalies([object[]]$devices) {
         }
     }
 
-    foreach ($d in $devices) {
-        if ([int]$d.Disabled -eq 1) {
-            $fid = $d.FallbackID
-            if ($fid -ne $null -and ("" + $fid).Trim() -ne "") {
-                $anoms.Add([ordered]@{
-                    type = "DisabledHasFallback"
-                    deviceId = [int]$d.DeviceID
-                    deviceName = $d.DeviceName
-                    fallbackId = [int]$fid
-                    message = "Disabled device has a fallback set (review if intended)."
-                })
-            }
-        }
-    }
-
     return @($anoms)
 }
 
-# -------------------------
-# Optional Fix (safe + limited)
-# v1 fix policy:
-# - Only clears invalid/self fallback IDs: sets FallbackID = NULL
-# -------------------------
-function Apply-Fix([System.Data.SqlClient.SqlConnection]$Conn, [int]$VenueID, [object[]]$devices, [object[]]$anomalies) {
+function Apply-Fix_ClearInvalidFallbacks([System.Data.SqlClient.SqlConnection]$Conn, [object[]]$devices, [object[]]$anomalies) {
     $script:Report.results.fix.attempted = $true
 
     $fixable = $anomalies | Where-Object { $_.type -in @("SelfFallback","MissingFallbackDevice") }
     if (-not $fixable -or $fixable.Count -eq 0) {
-        $script:Report.results.fix.supported = $true
-        $script:Report.results.fix.applied = $false
         $script:Report.results.fix.reason = "No fixable anomalies found (v1 only clears invalid/self fallback IDs)."
-        Out ""
-        Out "Apply Fix: nothing fixable found (v1 only clears invalid/self fallback IDs)."
+        Out "Apply Fix: nothing to do."
         return
     }
 
     $msg = @"
-Apply Fix will make SQL changes for this venue:
+Apply Fix will change SQL for fallback settings:
 
-- For printers where FallbackID is invalid OR references itself:
-  -> FallbackID will be cleared (set to NULL)
+- Clears invalid/self FallbackID values (sets FallbackID = NULL)
+- Does NOT assign new fallback printers
 
-It will NOT automatically assign new fallback printers.
-
-To proceed, tick the checkbox and type YES.
+Tick the box and type YES to proceed.
 "@
 
     $confirmed = Show-ConfirmFixDialog -Title "Printer Fallback Audit - Apply Fix" -Message $msg
     if (-not $confirmed) {
-        $script:Report.results.fix.applied = $false
-        $script:Report.results.fix.reason = "User did not confirm Apply Fix."
-        Out ""
-        Out "Apply Fix cancelled by user."
+        $script:Report.results.fix.reason = "User cancelled."
+        Out "Apply Fix cancelled."
         return
     }
 
     $script:Report.inputs.ApplyFix = $true
-
-    Out ""
-    Out "Applying fixes (clearing invalid/self fallback IDs)..."
 
     foreach ($a in $fixable) {
         $deviceId = [int]$a.deviceId
@@ -542,11 +449,10 @@ To proceed, tick the checkbox and type YES.
             anomalyType = $a.type
         }
 
-        $sql = "UPDATE dbo.Device SET FallbackID = NULL WHERE DeviceID = @DeviceID;"
-        $affected = Invoke-NonQuery -Conn $Conn -Sql $sql -Params @{ DeviceID = $deviceId }
+        $affected = Invoke-SqlNonQuery -Conn $Conn -Sql "UPDATE dbo.Device SET FallbackID = NULL WHERE DeviceID = @DeviceID;" -Params @{ DeviceID = $deviceId }
 
-        $dtAfter = Invoke-Query -Conn $Conn -Sql "SELECT d.DeviceID, d.Name AS DeviceName, d.FallbackID, fb.Name AS FallbackDeviceName FROM dbo.Device d LEFT JOIN dbo.Device fb ON fb.DeviceID = d.FallbackID WHERE d.DeviceID = @DeviceID;" -Params @{ DeviceID = $deviceId }
-        $afterObj = (DT $dtAfter | Select-Object -First 1)
+        $dtAfter = Invoke-SqlQuery -Conn $Conn -Sql "SELECT d.DeviceID, d.Name AS DeviceName, d.FallbackID, fb.Name AS FallbackDeviceName FROM dbo.Device d LEFT JOIN dbo.Device fb ON fb.DeviceID = d.FallbackID WHERE d.DeviceID = @DeviceID;" -Params @{ DeviceID = $deviceId }
+        $afterObj = (DataTable-ToObjects $dtAfter | Select-Object -First 1)
 
         $after = [ordered]@{
             deviceId = [int]$afterObj.DeviceID
@@ -557,19 +463,17 @@ To proceed, tick the checkbox and type YES.
         }
 
         $script:Report.results.fix.beforeAfter += [ordered]@{ before = $before; after = $after }
-
-        Out ("  Cleared fallback for DeviceID {0} ({1}) [RowsAffected={2}]" -f $deviceId, $deviceRow.DeviceName, $affected)
+        Out ("Cleared fallback for DeviceID {0} ({1}) [RowsAffected={2}]" -f $deviceId, $deviceRow.DeviceName, $affected)
     }
 
     $script:Report.results.fix.applied = $true
-    $script:Report.results.fix.reason = "Cleared invalid/self fallback IDs only (v1 safe fix)."
-    Out "Fix complete."
+    $script:Report.results.fix.reason  = "Cleared invalid/self fallback IDs only."
 }
 
-# -------------------------
-# Main execution
-# -------------------------
-Out "Bepoz Onboarding Toolkit - Printer Fallback Audit"
+# =========================
+# Main
+# =========================
+Out "Printer Fallback Audit"
 Out "RunDir: $($script:Report.runDir)"
 Out ""
 
@@ -577,16 +481,11 @@ $conn = $null
 try {
     $cfg = Get-SqlConfig
 
-    Out ""
-    Out "Connecting to SQL..."
+    Out "Opening SQL connection (local only)..."
     $conn = Open-SqlConnection -Server $cfg.Server -Database $cfg.Database
     Out "Connected."
 
-    $venues = Get-VenueList -Conn $conn
-    if (-not $venues -or $venues.Count -eq 0) { Fail "No venues found in dbo.Venue." 6 }
-
-    $venuePrompt = "Enter VenueID (integer) to audit.`r`nTip: there are $($venues.Count) venues; check dbo.Venue if unsure."
-    $rawVenue = Show-InputBox -Title "Printer Fallback Audit" -Prompt $venuePrompt -DefaultValue ""
+    $rawVenue = Show-InputBox -Title "Printer Fallback Audit" -Prompt "Enter VenueID (integer) to audit:" -DefaultValue ""
     if ($null -eq $rawVenue) { Fail "User cancelled VenueID prompt." 7 }
 
     $rawVenue = $rawVenue.Trim()
@@ -599,19 +498,15 @@ try {
     $script:Report.results.venue = [ordered]@{ VenueID = [int]$venue.VenueID; Name = $venue.Name }
 
     Out ""
-    Out "Auditing Venue: [$venueId] $($venue.Name)"
+    Out "Auditing venue: [$venueId] $($venue.Name)"
     Out ""
 
     $devices = Get-VenuePrintingDevices -Conn $conn -VenueID $venueId
 
     $script:Report.results.counts.printers = ($devices | Measure-Object).Count
     $withFallback = ($devices | Where-Object { $_.FallbackID -ne $null -and (""+$_.FallbackID).Trim() -ne "" }).Count
-    $withoutFallback = $script:Report.results.counts.printers - $withFallback
-    $disabled = ($devices | Where-Object { [int]$_.Disabled -eq 1 }).Count
-
     $script:Report.results.counts.withFallback = $withFallback
-    $script:Report.results.counts.withoutFallback = $withoutFallback
-    $script:Report.results.counts.disabled = $disabled
+    $script:Report.results.counts.withoutFallback = $script:Report.results.counts.printers - $withFallback
 
     $anoms = Find-Anomalies -devices $devices
     $script:Report.results.anomalies = @($anoms)
@@ -637,42 +532,36 @@ try {
     )
 
     Out "Summary"
-    Out "  Printers found:        $($script:Report.results.counts.printers)"
-    Out "  With fallback:         $withFallback"
-    Out "  Without fallback:      $withoutFallback"
-    Out "  Disabled printers:     $disabled"
-    Out "  Anomalies:             $($script:Report.results.counts.anomalies)"
+    Out "  Printers found:   $($script:Report.results.counts.printers)"
+    Out "  With fallback:    $($script:Report.results.counts.withFallback)"
+    Out "  Without fallback: $($script:Report.results.counts.withoutFallback)"
+    Out "  Anomalies:        $($script:Report.results.counts.anomalies)"
     Out ""
 
-    if ($script:Report.results.counts.printers -eq 0) {
-        Out "NOTE: No printers matched the v1 heuristic for this venue."
-        Out "      If this is wrong, we should tighten the definition using known DeviceType/SubType values for printers."
-        $script:Report.warnings += "No printers matched v1 heuristic; may need printer DeviceType/SubType list."
-    } else {
-        Out "Printers (venue-wide):"
+    if ($devices.Count -gt 0) {
         Out "Store | Workstation | DeviceID | DeviceName | Port | Disabled | FallbackID | FallbackDeviceName"
         foreach ($d in $devices) {
-            $line = "{0} | {1} | {2} | {3} | {4} | {5} | {6} | {7}" -f `
-                ($d.StoreName ?? ""), ($d.WorkstationName ?? ""), $d.DeviceID, ($d.DeviceName ?? ""), ($d.PortName ?? ""), $d.Disabled, ($d.FallbackID ?? ""), ($d.FallbackDeviceName ?? "")
-            Out $line
+            Out ("{0} | {1} | {2} | {3} | {4} | {5} | {6} | {7}" -f `
+                ($d.StoreName ?? ""), ($d.WorkstationName ?? ""), $d.DeviceID, ($d.DeviceName ?? ""), ($d.PortName ?? ""), $d.Disabled, ($d.FallbackID ?? ""), ($d.FallbackDeviceName ?? ""))
         }
+        Out ""
+    } else {
+        Out "NOTE: No devices matched the v1 printer heuristic for this venue."
+        Out "      If incorrect, confirm printer DeviceType/SubType values and we will tighten the filter."
         Out ""
     }
 
-    if ($script:Report.results.counts.anomalies -gt 0) {
+    if ($anoms.Count -gt 0) {
         Out "Anomalies:"
         foreach ($a in $anoms) {
             Out ("- {0}: DeviceID {1} ({2}) -> {3}" -f $a.type, $a.deviceId, $a.deviceName, $a.message)
         }
         Out ""
-    } else {
-        Out "No anomalies detected (based on v1 rules)."
-        Out ""
     }
 
-    Apply-Fix -Conn $conn -VenueID $venueId -devices $devices -anomalies $anoms
+    # Optional fix (safe, limited)
+    Apply-Fix_ClearInvalidFallbacks -Conn $conn -devices $devices -anomalies $anoms
 
-    $script:Report.status = "success"
     Succeed
 }
 catch {

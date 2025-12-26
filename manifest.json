@@ -10,12 +10,12 @@
       "entryPoint": "tools/doctor/run.ps1"
     },
     {
-      "toolId": "printer-fallback-audit",
-      "name": "Printer Fallback Audit",
-      "description": "Audit printing devices in a venue and report/set fallback devices (with explicit confirmation).",
-      "toolVersion": "1.0.0",
-      "packageType": "repo",
-      "entryPoint": "tools/printer-fallback-audit/run.ps1"
+    "toolId": "printer-fallback-audit",
+  "name": "Printer Fallback Audit",
+  "description": "Audits printer fallback settings for a selected VenueID and reports anomalies; optional safe Apply Fix can clear invalid/self fallback IDs with explicit GUI confirmation.",
+  "toolVersion": "1.1.0",
+  "packageType": "repo",
+  "entryPoint": "tools/printer-fallback-audit/run.ps1"
     }
   ]
 }

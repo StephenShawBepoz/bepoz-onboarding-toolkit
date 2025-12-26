@@ -68,6 +68,19 @@ function Clear-ToolkitCache {
 }
 # ----------------------------------------
 
+$iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+$rs  = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace($iss)
+
+$rs.ApartmentState = "STA"          # <- this is the key
+$rs.ThreadOptions  = "ReuseThread"  # helps with WinForms stability
+$rs.Open()
+
+$ps = [PowerShell]::Create()
+$ps.Runspace = $rs
+
+# ----------------------------------------
+
+
 function Ensure-Tls12 {
   try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
 }

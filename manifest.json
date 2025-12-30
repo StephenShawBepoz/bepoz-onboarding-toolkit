@@ -40,6 +40,14 @@
   "toolVersion": "1.0.0",
   "packageType": "repo",
   "entryPoint": "tools/venue-check/run.ps1"
+},
+    {
+  "toolId": "venue-cardnames-propagate",
+  "name": "Venue Cardnames Propagate",
+  "description": "Closes running Bepoz apps under C:\\Bepoz\\Programs, copies cardname_1..cardname_16 from a master VenueID to all other venues, then reopens the apps. Safe-by-default audit mode.",
+  "toolVersion": "1.0.0",
+  "packageType": "repo",
+  "entryPoint": "tools/venue-cardnames-propagate/run.ps1"
 }
   ]
 }

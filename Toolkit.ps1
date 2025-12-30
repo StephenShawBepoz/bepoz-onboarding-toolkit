@@ -135,6 +135,13 @@ function Get-Tool([object]$manifest, [string]$toolId) {
   return $t
 }
 
+function Download-File([string]$url, [string]$outFile) {
+  Ensure-Tls12
+  $dir = Split-Path -Parent $outFile
+  if ($dir) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+  Invoke-WebRequest -Uri $url -OutFile $outFile -UseBasicParsing
+}
+
 function Ensure-ToolInstalled([object]$tool) {
   $entry = [string]$tool.entryPoint
   if (-not $entry) { throw "Tool '$($tool.toolId)' missing entryPoint in manifest." }
@@ -143,22 +150,17 @@ function Ensure-ToolInstalled([object]$tool) {
   if ($tool.PSObject.Properties.Name -contains "files" -and $tool.files) {
     $files += @($tool.files)
   } else {
-    $files += @($entry)
+    $files += $entry
   }
 
-  $toolDir = Join-Path $ToolsDir $tool.toolId
-  foreach ($f in $files) {
-    $rel = ($f -replace "/","\")
-    $disk = Join-Path $Root $rel
-    if (-not (Test-Path $disk)) {
-      throw "Tool files are missing on disk. Expected: $disk`r`n(Ensure sync has run and tool is present in repo.)"
+  foreach ($rel in $files) {
+    $rel = $rel -replace "\\","/"
+    $dest = Join-Path $Root ($rel -replace "/","\")
+    if (-not (Test-Path $dest)) {
+      $url = "https://raw.githubusercontent.com/$RepoOwner/$RepoName/$Branch/$rel"
+      Write-Log "Downloading tool file: $rel"
+      Download-File -url $url -outFile $dest
     }
-  }
-
-  if (-not (Test-Path $toolDir)) {
-    # Tools in repo are already laid out under $Root\tools\<id>\...
-    # This simply ensures the folder exists.
-    New-Item -ItemType Directory -Force -Path $toolDir | Out-Null
   }
 }
 

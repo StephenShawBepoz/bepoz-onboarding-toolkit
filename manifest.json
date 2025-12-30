@@ -23,7 +23,7 @@
       "description": "Creates POS terminals by cloning a template Workstation into a selected Venue and Store (dry-run by default, with explicit confirmation).",
       "toolVersion": "1.0.0",
       "packageType": "repo",
-      "entryPoint": "tools/create-pos-terminals/run.ps1"
+      "entryPoint": "tools/create-pos-terminal/run.ps1"
     }
   ]
 }

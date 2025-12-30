@@ -29,7 +29,7 @@
   "toolId": "store-create-assign-venue",
   "name": "Create Store + Assign to Venue",
   "description": "Creates a new dbo.Store and assigns it to a dbo.Venue (Store.VenueID). Safe by default (DryRun). Writes Report.json to RunDir.",
-  "toolVersion": "1.0.0",
+  "toolVersion": "1.1.0",
   "packageType": "repo",
   "entryPoint": "tools/store-create-assign-venue/run.ps1"
 }

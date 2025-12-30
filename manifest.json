@@ -49,7 +49,6 @@
   "toolVersion": "1.0.0",
   "packageType": "repo",
   "entryPoint": "tools/cardname-propagate/run.ps1"
-}
-}
+},
   ]
 }

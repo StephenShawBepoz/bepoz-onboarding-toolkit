@@ -23,36 +23,106 @@ $TempDir   = Join-Path $Root "temp"
 $ManifestUrl = "https://raw.githubusercontent.com/$RepoOwner/$RepoName/$Branch/manifest.json"
 # ----------------------------------------
 
-function Ensure-Tls12 {
-  try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+# ---------------- BACK OFFICE SQL CONTEXT ----------------
+# All tools depend on SQL. The toolbox reads these values once and shares them with every tool run:
+#   HKCU:\Software\BackOffice
+#     - SQL_DSN    (database name)
+#     - SQL_Server (server\instance)
+$BackOfficeRegPath = "HKCU:\Software\BackOffice"
+
+function Get-BackOfficeSqlSettings {
+  param([string]$RegistryPath = $BackOfficeRegPath)
+
+  $r = [ordered]@{
+    registryPath = $RegistryPath
+    dsn          = $null
+    server       = $null
+    ok           = $false
+    warnings     = @()
+  }
+
+  try {
+    $p = Get-ItemProperty -Path $RegistryPath -ErrorAction Stop
+  } catch {
+    $r.warnings += "Registry key not found: $RegistryPath"
+    return [pscustomobject]$r
+  }
+
+  $dsn    = $p.SQL_DSN
+  $server = $p.SQL_Server
+
+  if ([string]::IsNullOrWhiteSpace([string]$dsn)) {
+    $r.warnings += "SQL_DSN is missing or blank in $RegistryPath"
+  } else {
+    $r.dsn = [string]$dsn
+  }
+
+  if ([string]::IsNullOrWhiteSpace([string]$server)) {
+    $r.warnings += "SQL_Server is missing or blank in $RegistryPath"
+  } else {
+    $r.server = [string]$server
+  }
+
+  $r.ok = ($r.warnings.Count -eq 0)
+  return [pscustomobject]$r
 }
+
+function New-ToolkitContext {
+  $sql = Get-BackOfficeSqlSettings
+
+  $ctx = [ordered]@{
+    schemaVersion = 1
+    checkedAt     = (Get-Date).ToString("o")
+    backOffice    = @{
+      registryPath = $sql.registryPath
+      sql          = @{
+        dsn      = $sql.dsn
+        server   = $sql.server
+        ok       = [bool]$sql.ok
+        warnings = @($sql.warnings)
+      }
+    }
+  }
+
+  return [pscustomobject]$ctx
+}
+
+function Set-ToolkitSqlEnvironment {
+  param([object]$Context)
+
+  if (-not $Context) { return }
+  $env:BEPOZ_SQL_REGPATH = [string]$Context.backOffice.registryPath
+
+  $dsn = [string]$Context.backOffice.sql.dsn
+  if (-not [string]::IsNullOrWhiteSpace($dsn)) { $env:BEPOZ_SQL_DSN = $dsn }
+
+  $srv = [string]$Context.backOffice.sql.server
+  if (-not [string]::IsNullOrWhiteSpace($srv)) { $env:BEPOZ_SQL_SERVER = $srv }
+}
+
+# Initialise context on startup (refreshed again in the UI and per tool run).
+$Global:ToolkitContext = New-ToolkitContext
+Set-ToolkitSqlEnvironment -Context $Global:ToolkitContext
+# -----------------------------------------------------------
 
 function Ensure-Dirs {
-  New-Item -ItemType Directory -Force -Path $Root,$CatDir,$ToolsDir,$RunsDir,$LogsDir,$TempDir | Out-Null
-}
-
-function Write-Log([string]$msg) {
-  $ts = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-  $line = "[$ts] $msg"
-  Write-Host $line
-  try {
-    $path = Join-Path $LogsDir ("toolkit_{0}.log" -f (Get-Date -Format "yyyyMMdd"))
-    Add-Content -Path $path -Value $line -Encoding UTF8
-  } catch {}
+  New-Item -ItemType Directory -Force -Path $Root, $CatDir, $ToolsDir, $RunsDir, $LogsDir, $TempDir | Out-Null
 }
 
 function Download-File([string]$url, [string]$outFile) {
-  Ensure-Tls12
-  $dir = Split-Path -Parent $outFile
-  if ($dir) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
-  Invoke-WebRequest -Uri $url -OutFile $outFile -UseBasicParsing
+  Write-Host "Downloading: $url"
+  $wc = New-Object System.Net.WebClient
+  try {
+    $wc.Headers["User-Agent"] = "BepozOnboardingToolkit"
+    $wc.DownloadFile($url, $outFile)
+  } finally {
+    $wc.Dispose()
+  }
 }
 
 function Load-Manifest {
   Ensure-Dirs
   $localManifest = Join-Path $CatDir "manifest.json"
-  Write-Log "Downloading manifest..."
-  Write-Log $ManifestUrl
   Download-File -url $ManifestUrl -outFile $localManifest
   $json = Get-Content -Raw -Path $localManifest -Encoding UTF8 | ConvertFrom-Json
   if (-not $json.tools) { throw "manifest.json missing 'tools' array." }
@@ -73,67 +143,47 @@ function Ensure-ToolInstalled([object]$tool) {
   if ($tool.PSObject.Properties.Name -contains "files" -and $tool.files) {
     $files += @($tool.files)
   } else {
-    $files += $entry
+    $files += @($entry)
   }
 
-  foreach ($rel in $files) {
-    $rel = $rel -replace "\\","/"
-    $dest = Join-Path $Root ($rel -replace "/","\")
-    if (-not (Test-Path $dest)) {
-      $url = "https://raw.githubusercontent.com/$RepoOwner/$RepoName/$Branch/$rel"
-      Write-Log "Downloading tool file: $rel"
-      Download-File -url $url -outFile $dest
+  $toolDir = Join-Path $ToolsDir $tool.toolId
+  foreach ($f in $files) {
+    $rel = ($f -replace "/","\")
+    $disk = Join-Path $Root $rel
+    if (-not (Test-Path $disk)) {
+      throw "Tool files are missing on disk. Expected: $disk`r`n(Ensure sync has run and tool is present in repo.)"
     }
+  }
+
+  if (-not (Test-Path $toolDir)) {
+    # Tools in repo are already laid out under $Root\tools\<id>\...
+    # This simply ensures the folder exists.
+    New-Item -ItemType Directory -Force -Path $toolDir | Out-Null
   }
 }
 
 function New-RunDir([string]$toolId) {
-  $stamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
-  $guid  = ([Guid]::NewGuid().ToString("N")).Substring(0,8)
-  $dir   = Join-Path $RunsDir ("{0}_{1}_{2}" -f $stamp,$toolId,$guid)
-  New-Item -ItemType Directory -Force -Path $dir | Out-Null
-  return $dir
+  Ensure-Dirs
+  $stamp = (Get-Date).ToString("yyyyMMdd_HHmmss")
+  $runDir = Join-Path $RunsDir ("{0}_{1}" -f $toolId, $stamp)
+  New-Item -ItemType Directory -Force -Path $runDir | Out-Null
+  return $runDir
 }
 
-# ---------------- Cache / housekeeping ----------------
 function Clear-ToolkitCache {
   param(
     [switch]$OnOpen,
-    [switch]$OnClose,
     [int]$PruneRunsOlderThanDays = 30
   )
 
-  Write-Host ("[Cache] Clearing cache ({0})..." -f ($(if($OnOpen){"open"}elseif($OnClose){"close"}else{"manual"})))
-
-  # Force fresh manifest on next refresh
-  $manifestPath = Join-Path $CatDir "manifest.json"
-  if (Test-Path $manifestPath) {
-    Remove-Item -Force $manifestPath -ErrorAction SilentlyContinue
-    Write-Host "[Cache] Deleted cached manifest.json"
-  }
-
-  # Clear temp downloads
-  if (Test-Path $TempDir) {
-    Get-ChildItem -Path $TempDir -Force -ErrorAction SilentlyContinue | Remove-Item -Force -Recurse -ErrorAction SilentlyContinue
-    Write-Host "[Cache] Cleared temp folder"
-  }
-
-  # Optional: prune old runs
-  if ($PruneRunsOlderThanDays -gt 0 -and (Test-Path $RunsDir)) {
-    $cutoff = (Get-Date).AddDays(-$PruneRunsOlderThanDays)
+  if ($OnOpen) {
+    # Prune old runs
+    $cut = (Get-Date).AddDays(-$PruneRunsOlderThanDays)
     Get-ChildItem -Path $RunsDir -Directory -ErrorAction SilentlyContinue |
-      Where-Object { $_.LastWriteTime -lt $cutoff } |
-      ForEach-Object {
-        try {
-          Remove-Item -LiteralPath $_.FullName -Force -Recurse -ErrorAction Stop
-          Write-Host "[Cache] Pruned old run: $($_.Name)"
-        } catch {
-          Write-Host "[Cache] Could not prune $($_.Name): $($_.Exception.Message)"
-        }
-      }
+      Where-Object { $_.LastWriteTime -lt $cut } |
+      ForEach-Object { try { Remove-Item -Recurse -Force -Path $_.FullName } catch {} }
   }
 }
-# -----------------------------------------------------
 
 function Start-ToolProcess([object]$tool, [string]$runDir) {
   $toolId    = [string]$tool.toolId
@@ -143,6 +193,11 @@ function Start-ToolProcess([object]$tool, [string]$runDir) {
 
   $outLog = Join-Path $runDir "Output.log"
   $runner = Join-Path $runDir "RunTool.ps1"
+
+  # Refresh SQL context for this run (reads HKCU:\Software\BackOffice)
+  $Global:ToolkitContext = New-ToolkitContext
+  Set-ToolkitSqlEnvironment -Context $Global:ToolkitContext
+  $ctxJson = $Global:ToolkitContext | ConvertTo-Json -Depth 10
 
   # This runner captures ALL output (including Write-Host) via transcript,
   # and runs in STA so WinForms dialogs can display.
@@ -155,6 +210,16 @@ try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::
 `$env:BEPoz_TOOLKIT_RUNDIR = `$runDir
 
 New-Item -ItemType Directory -Force -Path `$runDir | Out-Null
+# Share SQL context with tools (available via env vars and ToolkitContext.json)
+`$ctxPath = Join-Path `$runDir "ToolkitContext.json"
+@'
+$ctxJson
+'@ | Set-Content -Path `$ctxPath -Encoding UTF8
+
+Write-Host "SQL_Server:  $env:BEPOZ_SQL_SERVER"
+Write-Host "SQL_DSN:     $env:BEPOZ_SQL_DSN"
+Write-Host "Context:     `$ctxPath"
+
 
 try {
   Start-Transcript -Path `$outLog -Append | Out-Null
@@ -183,6 +248,12 @@ try {
   $psi.WorkingDirectory = $Root
   $psi.UseShellExecute = $false
   $psi.CreateNoWindow = $true
+
+  # Pass SQL settings to the child PowerShell process
+  $sql = $Global:ToolkitContext.backOffice.sql
+  if ($sql -and $sql.dsn)    { $psi.EnvironmentVariables["BEPOZ_SQL_DSN"]    = [string]$sql.dsn }
+  if ($sql -and $sql.server) { $psi.EnvironmentVariables["BEPOZ_SQL_SERVER"] = [string]$sql.server }
+  $psi.EnvironmentVariables["BEPOZ_SQL_REGPATH"] = [string]$Global:ToolkitContext.backOffice.registryPath
 
   $p = [System.Diagnostics.Process]::Start($psi)
 
@@ -226,6 +297,15 @@ function Show-Ui {
   Ensure-Dirs
   Clear-ToolkitCache -OnOpen -PruneRunsOlderThanDays 30
 
+  # Read BackOffice SQL settings on open and expose them to every tool
+  $Global:ToolkitContext = New-ToolkitContext
+  Set-ToolkitSqlEnvironment -Context $Global:ToolkitContext
+
+  if (-not $Global:ToolkitContext.backOffice.sql.ok) {
+    $warn = "BackOffice SQL settings were not found or are incomplete.`r`n`r`nExpected in HKCU:\Software\BackOffice:`r`n  SQL_Server  (server\instance)`r`n  SQL_DSN     (database name)`r`n`r`nTools that query SQL may fail until these are set."
+    [System.Windows.Forms.MessageBox]::Show($warn, "Bepoz Toolkit - SQL settings", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+  }
+
   $m = Load-Manifest
 
   $form = New-Object System.Windows.Forms.Form
@@ -234,13 +314,9 @@ function Show-Ui {
   $form.Height = 620
   $form.StartPosition = "CenterScreen"
 
-  $form.Add_FormClosed({
-    try { Clear-ToolkitCache -OnClose -PruneRunsOlderThanDays 30 } catch {}
-  })
-
   $list = New-Object System.Windows.Forms.ListBox
+  $list.Width = 280
   $list.Dock = "Left"
-  $list.Width = 260
 
   $panel = New-Object System.Windows.Forms.Panel
   $panel.Dock = "Fill"
@@ -251,6 +327,22 @@ function Show-Ui {
   $lblName.Dock = "Top"
   $lblName.Font = New-Object System.Drawing.Font("Segoe UI", 11, [System.Drawing.FontStyle]::Bold)
   $lblName.Padding = "8,6,8,0"
+
+  $lblSql = New-Object System.Windows.Forms.Label
+  $lblSql.AutoSize = $false
+  $lblSql.Height = 42
+  $lblSql.Dock = "Top"
+  $lblSql.Padding = "8,0,8,0"
+  $lblSql.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+  $lblSql.Text = ""
+
+  # Display BackOffice SQL settings (shared with tools via env vars + ToolkitContext.json)
+  $sql = $Global:ToolkitContext.backOffice.sql
+  if ($sql.ok) {
+    $lblSql.Text = "SQL: {0}   DB: {1}   (from {2})" -f $sql.server, $sql.dsn, $Global:ToolkitContext.backOffice.registryPath
+  } else {
+    $lblSql.Text = "SQL settings missing/incomplete (HKCU:\Software\BackOffice). Tools may fail to connect."
+  }
 
   $txtDesc = New-Object System.Windows.Forms.TextBox
   $txtDesc.Multiline = $true
@@ -267,16 +359,16 @@ function Show-Ui {
   $outBox = New-Object System.Windows.Forms.TextBox
   $outBox.Multiline = $true
   $outBox.ReadOnly = $true
-  $outBox.ScrollBars = "Both"
+  $outBox.ScrollBars = "Vertical"
   $outBox.Dock = "Fill"
-  $outBox.Font = New-Object System.Drawing.Font("Consolas", 9)
   $tabOut.Controls.Add($outBox)
 
   $tabInfo = New-Object System.Windows.Forms.TabPage
-  $tabInfo.Text = "Details"
+  $tabInfo.Text = "Toolkit Info"
   $infoBox = New-Object System.Windows.Forms.TextBox
   $infoBox.Multiline = $true
   $infoBox.ReadOnly = $true
+  $infoBox.Text = "Tools run from: $Root`r`nRuns folder: $RunsDir`r`n`r`nSQL context:`r`n  BEPOZ_SQL_SERVER=$env:BEPOZ_SQL_SERVER`r`n  BEPOZ_SQL_DSN=$env:BEPOZ_SQL_DSN"
   $infoBox.ScrollBars = "Vertical"
   $infoBox.Dock = "Fill"
   $tabInfo.Controls.Add($infoBox)
@@ -293,23 +385,22 @@ function Show-Ui {
   $btnExit = New-Object System.Windows.Forms.Button
   $btnExit.Text = "Exit"
   $btnExit.Width = 90
-
-  $btnRun = New-Object System.Windows.Forms.Button
-  $btnRun.Text = "Run"
-  $btnRun.Width = 90
+  $btnExit.Add_Click({ $form.Close() })
+  $btnPanel.Controls.Add($btnExit) | Out-Null
 
   $btnRefresh = New-Object System.Windows.Forms.Button
   $btnRefresh.Text = "Refresh"
   $btnRefresh.Width = 90
+  $btnPanel.Controls.Add($btnRefresh) | Out-Null
 
-  $btnOpenRuns = New-Object System.Windows.Forms.Button
-  $btnOpenRuns.Text = "Open Runs Folder"
-  $btnOpenRuns.Width = 140
-
-  $btnPanel.Controls.AddRange(@($btnExit,$btnOpenRuns,$btnRun,$btnRefresh))
+  $btnRun = New-Object System.Windows.Forms.Button
+  $btnRun.Text = "Run"
+  $btnRun.Width = 90
+  $btnPanel.Controls.Add($btnRun) | Out-Null
 
   $panel.Controls.Add($tabs)
   $panel.Controls.Add($txtDesc)
+  $panel.Controls.Add($lblSql)
   $panel.Controls.Add($lblName)
   $panel.Controls.Add($btnPanel)
 
@@ -342,26 +433,20 @@ function Show-Ui {
     }
   })
 
-  $btnExit.Add_Click({ $form.Close() })
-
-  $btnOpenRuns.Add_Click({
-    try { Start-Process "explorer.exe" $RunsDir | Out-Null } catch {}
+  $list.Add_SelectedIndexChanged({
+    $sel = $list.SelectedItem
+    if (-not $sel) { return }
+    $t = $toolMap[$sel]
+    $lblName.Text = "{0}" -f $t.name
+    $txtDesc.Text = "{0}`r`n`r`nToolId: {1}    Version: {2}`r`nEntryPoint: {3}" -f $t.description, $t.toolId, $t.toolVersion, $t.entryPoint
   })
 
   $btnRefresh.Add_Click({
     try {
-      Clear-ToolkitCache -OnOpen -PruneRunsOlderThanDays 30
-
-      $outBox.Clear()
-      $infoBox.Clear()
-      $lblName.Text = ""
-      $txtDesc.Text = ""
-
+      $m2 = Load-Manifest
       $list.Items.Clear()
       $toolMap.Clear()
-
-      $script:m = Load-Manifest
-      foreach ($t in $script:m.tools) {
+      foreach ($t in $m2.tools) {
         $display = "{0}  (v{1})" -f $t.toolId, $t.toolVersion
         $toolMap[$display] = $t
         [void]$list.Items.Add($display)
@@ -369,19 +454,6 @@ function Show-Ui {
     } catch {
       [System.Windows.Forms.MessageBox]::Show("Refresh failed: $($_.Exception.Message)")
     }
-  })
-
-  $list.Add_SelectedIndexChanged({
-    $sel = $list.SelectedItem
-    if (-not $sel) { return }
-    $t = $toolMap[$sel]
-    $lblName.Text = "{0}" -f $t.name
-    $txtDesc.Text = "{0}`r`n`r`nToolId: {1}    Version: {2}`r`nEntryPoint: {3}" -f $t.description, $t.toolId, $t.toolVersion, $t.entryPoint
-    $infoBox.Text = ($t | ConvertTo-Json -Depth 8)
-
-    $outBox.Clear()
-    $currentOutLog = $null
-    $lastOutLen = 0
   })
 
   $btnRun.Add_Click({
@@ -415,24 +487,22 @@ function Show-Ui {
   [void]$form.ShowDialog()
 }
 
-# ---------------- Main ----------------
-Ensure-Dirs
-
 try {
   switch ($Command) {
     "init" {
-      Write-Host "Initialised: $Root"
+      Ensure-Dirs
+      Write-Host "Initialised at: $Root"
     }
     "sync" {
-      $null = Load-Manifest
-      Write-Host "Synced manifest to: $(Join-Path $CatDir 'manifest.json')"
+      Ensure-Dirs
+      Write-Host "Sync is repo-based in this toolkit layout. Ensure the repo contents exist under: $Root"
     }
     "list" {
       $m = Load-Manifest
-      $m.tools | ForEach-Object { $_.toolId }
+      $m.tools | ForEach-Object { "{0}`t{1}`t{2}" -f $_.toolId, $_.toolVersion, $_.name } | Write-Output
     }
     "run" {
-      if (-not $ToolId) { throw "Use: -Command run -ToolId <id>" }
+      if (-not $ToolId) { throw "ToolId is required for 'run' command." }
       Run-ToolConsole -toolId $ToolId
     }
     default {

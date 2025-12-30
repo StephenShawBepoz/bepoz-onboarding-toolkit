@@ -32,6 +32,14 @@
   "toolVersion": "1.1.0",
   "packageType": "repo",
   "entryPoint": "tools/store-create-assign-venue/run.ps1"
+},
+    {
+  "toolId": "venue-check",
+  "name": "Venue Check",
+  "description": "Read-only check: lists venues in dbo.Venue, basic sanity checks, exports CSV + Report.json.",
+  "toolVersion": "1.0.0",
+  "packageType": "repo",
+  "entryPoint": "tools/venue-check/run.ps1"
 }
   ]
 }

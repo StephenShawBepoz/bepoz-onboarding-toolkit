@@ -1,40 +1,57 @@
 #requires -Version 5.1
-<#
-Bepoz Toolkit Tool: Create Store + Assign to Venue
-- Safe by default (DryRun = true)
-- Writes Report.json to the RunDir
-- Uses Integrated Security to connect to SQL Server
-- Attempts to auto-discover a Bepoz database containing dbo.Venue + dbo.Store if Database not provided
-
-Config precedence:
-1) Explicit parameters
-2) Config JSON (default: CreateStore.config.json in RunDir, or -ConfigPath)
-3) Environment variables:
-   BEPOZ_SQLSERVER, BEPOZ_DATABASE, BEPOZ_VENUEID, BEPOZ_STORENAME, BEPOZ_STOREGROUP, BEPOZ_DRYRUN, BEPOZ_FORCE
-#>
-
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 param(
     [string]$ConfigPath,
 
-    [string]$SqlServer,
-    [string]$Database,
-
-    [int]$VenueId,
-    [string]$StoreName,
-    [int]$StoreGroup,
+    [string]$ToolkitRoot,
+    [string]$ToolId,
 
     [Nullable[bool]]$DryRun,
-    [switch]$Force
+    [switch]$Force,
+
+    [string]$RepoZipUrl
 )
 
-# ----------------------------
-# Paths + report scaffolding
-# ----------------------------
-$RunDir = $PSScriptRoot
+function Test-PathWritable {
+    param([string]$Path)
+    try {
+        if (-not (Test-Path -LiteralPath $Path)) { return $false }
+        $probe = Join-Path $Path ("._writeprobe_" + [Guid]::NewGuid().ToString("N") + ".tmp")
+        "probe" | Set-Content -LiteralPath $probe -Encoding UTF8 -ErrorAction Stop
+        Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Resolve-RunDir {
+    # Prefer an explicit run directory if the launcher provides it
+    foreach ($envName in @("TOOLKIT_RUNDIR","BEPOZ_RUNDIR","RUN_DIR","RUNDIR")) {
+        $v = [Environment]::GetEnvironmentVariable($envName)
+        if (-not [string]::IsNullOrWhiteSpace($v) -and (Test-Path -LiteralPath $v)) {
+            if (Test-PathWritable -Path $v) { return (Resolve-Path -LiteralPath $v).Path }
+        }
+    }
+
+    # Next best: current working directory (what the launcher likely sets per-job)
+    try {
+        $cwd = (Get-Location).Path
+        if (-not [string]::IsNullOrWhiteSpace($cwd) -and (Test-Path -LiteralPath $cwd)) {
+            if (Test-PathWritable -Path $cwd) { return (Resolve-Path -LiteralPath $cwd).Path }
+        }
+    } catch {}
+
+    # Fallback: tool folder
+    return (Resolve-Path -LiteralPath $PSScriptRoot).Path
+}
+
+$RunDir = Resolve-RunDir
 $ReportPath = Join-Path $RunDir "Report.json"
+$ToolLogPath = Join-Path $RunDir "Tool.log"
+$MarkerPath = Join-Path $RunDir "Started.marker"
 
 function Write-Log {
     param(
@@ -43,14 +60,15 @@ function Write-Log {
         [string]$Message
     )
     $ts = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-    Write-Host "[$ts][$Level] $Message"
+    $line = "[$ts][$Level] $Message"
+    Write-Host $line
+    try { Add-Content -LiteralPath $ToolLogPath -Value $line -Encoding UTF8 -ErrorAction SilentlyContinue } catch {}
 }
 
 function Save-Report {
     param([hashtable]$Report)
     try {
-        $ReportJson = ($Report | ConvertTo-Json -Depth 10)
-        $ReportJson | Set-Content -Path $ReportPath -Encoding UTF8
+        ($Report | ConvertTo-Json -Depth 15) | Set-Content -Path $ReportPath -Encoding UTF8
         Write-Log INFO "Wrote report: $ReportPath"
     } catch {
         Write-Log ERROR "Failed to write Report.json: $($_.Exception.Message)"
@@ -58,27 +76,23 @@ function Save-Report {
 }
 
 function Test-IsInteractive {
-    # Conservative: only treat as interactive if console host and UserInteractive.
     try {
         if (-not [Environment]::UserInteractive) { return $false }
         if ($Host -and $Host.Name -eq "ConsoleHost") { return $true }
         return $false
-    } catch {
-        return $false
-    }
+    } catch { return $false }
 }
 
 function Read-JsonFile {
     param([string]$Path)
-    if (-not $Path) { return $null }
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
     if (-not (Test-Path -LiteralPath $Path)) { return $null }
     $raw = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
     if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
     return ($raw | ConvertFrom-Json -ErrorAction Stop)
 }
 
-function Get-EnvBool {
-    param([string]$Name)
+function Get-EnvBool([string]$Name) {
     $v = [Environment]::GetEnvironmentVariable($Name)
     if ([string]::IsNullOrWhiteSpace($v)) { return $null }
     switch -Regex ($v.Trim().ToLowerInvariant()) {
@@ -88,357 +102,190 @@ function Get-EnvBool {
     }
 }
 
-function Get-EnvInt {
-    param([string]$Name)
-    $v = [Environment]::GetEnvironmentVariable($Name)
-    if ([string]::IsNullOrWhiteSpace($v)) { return $null }
-    $out = 0
-    if ([int]::TryParse($v.Trim(), [ref]$out)) { return $out }
-    return $null
-}
-
-function Get-EnvString {
-    param([string]$Name)
+function Get-EnvString([string]$Name) {
     $v = [Environment]::GetEnvironmentVariable($Name)
     if ([string]::IsNullOrWhiteSpace($v)) { return $null }
     return $v.Trim()
 }
 
-function New-SqlConnection {
-    param(
-        [string]$Server,
-        [string]$Db
-    )
-    if ([string]::IsNullOrWhiteSpace($Server)) {
-        throw "SqlServer is empty."
-    }
-    if ([string]::IsNullOrWhiteSpace($Db)) {
-        throw "Database is empty."
-    }
-
-    Add-Type -AssemblyName System.Data
-
-    $cs = "Server=$Server;Database=$Db;Integrated Security=SSPI;Connect Timeout=8;Application Name=BepozToolkit-CreateStore;"
-    $conn = New-Object System.Data.SqlClient.SqlConnection $cs
-    $conn.Open()
-    return $conn
-}
-
-function Invoke-SqlDataTable {
-    param(
-        [System.Data.SqlClient.SqlConnection]$Connection,
-        [string]$Sql,
-        [hashtable]$Parameters
-    )
-    $cmd = $Connection.CreateCommand()
-    $cmd.CommandText = $Sql
-    $cmd.CommandTimeout = 30
-
-    if ($Parameters) {
-        foreach ($k in $Parameters.Keys) {
-            $p = $cmd.Parameters.Add("@$k", [System.Data.SqlDbType]::Variant)
-            $p.Value = $Parameters[$k]
-        }
-    }
-
-    $da = New-Object System.Data.SqlClient.SqlDataAdapter $cmd
-    $dt = New-Object System.Data.DataTable
-    [void]$da.Fill($dt)
-    return $dt
-}
-
-function Invoke-SqlScalar {
-    param(
-        [System.Data.SqlClient.SqlConnection]$Connection,
-        [string]$Sql,
-        [hashtable]$Parameters
-    )
-    $cmd = $Connection.CreateCommand()
-    $cmd.CommandText = $Sql
-    $cmd.CommandTimeout = 30
-
-    if ($Parameters) {
-        foreach ($k in $Parameters.Keys) {
-            $p = $cmd.Parameters.Add("@$k", [System.Data.SqlDbType]::Variant)
-            $p.Value = $Parameters[$k]
-        }
-    }
-    return $cmd.ExecuteScalar()
-}
-
-function Test-DbHasVenueAndStoreTables {
-    param(
-        [string]$Server,
-        [string]$DbName
-    )
-    try {
-        $c = New-SqlConnection -Server $Server -Db $DbName
-        try {
-            $sql = @"
-SELECT
-  CASE
-    WHEN EXISTS (SELECT 1 FROM sys.tables t JOIN sys.schemas s ON s.schema_id=t.schema_id WHERE s.name='dbo' AND t.name='Venue')
-     AND EXISTS (SELECT 1 FROM sys.tables t JOIN sys.schemas s ON s.schema_id=t.schema_id WHERE s.name='dbo' AND t.name='Store')
-    THEN 1 ELSE 0
-  END;
-"@
-            $ok = Invoke-SqlScalar -Connection $c -Sql $sql -Parameters @{}
-            return ([int]$ok -eq 1)
-        } finally {
-            $c.Close()
-            $c.Dispose()
-        }
-    } catch {
-        return $false
-    }
-}
-
-function Find-BepozDatabases {
-    param([string]$Server)
-
-    $dbs = @()
-    $master = New-SqlConnection -Server $Server -Db "master"
-    try {
-        $dt = Invoke-SqlDataTable -Connection $master -Sql "SELECT name FROM sys.databases WHERE state = 0 AND database_id > 4 ORDER BY name;" -Parameters @{}
-        foreach ($row in $dt.Rows) {
-            $name = [string]$row["name"]
-            if ([string]::IsNullOrWhiteSpace($name)) { continue }
-            if (Test-DbHasVenueAndStoreTables -Server $Server -DbName $name) {
-                $dbs += $name
-            }
-        }
-    } finally {
-        $master.Close()
-        $master.Dispose()
-    }
-    return $dbs
-}
-
-function Get-NonNullableColumnsWithoutDefault {
-    param([System.Data.SqlClient.SqlConnection]$Conn)
-
-    $sql = @"
-SELECT
-  c.name AS ColumnName,
-  t.name AS TypeName,
-  c.max_length AS MaxLength,
-  c.precision AS [Precision],
-  c.scale AS [Scale],
-  c.is_identity AS IsIdentity,
-  c.is_computed AS IsComputed,
-  c.is_nullable AS IsNullable,
-  dc.definition AS DefaultDefinition
-FROM sys.columns c
-JOIN sys.types t ON t.user_type_id = c.user_type_id
-LEFT JOIN sys.default_constraints dc ON dc.parent_object_id = c.object_id AND dc.parent_column_id = c.column_id
-WHERE c.object_id = OBJECT_ID('dbo.Store')
-ORDER BY c.column_id;
-"@
-    $dt = Invoke-SqlDataTable -Connection $Conn -Sql $sql -Parameters @{}
-
-    $required = @()
-    foreach ($r in $dt.Rows) {
-        $isIdentity = [bool]$r["IsIdentity"]
-        $isComputed = [bool]$r["IsComputed"]
-        $isNullable = [bool]$r["IsNullable"]
-        $defaultDef = $r["DefaultDefinition"]
-
-        if ($isIdentity -or $isComputed) { continue }
-        if ($isNullable) { continue }
-        if ($null -ne $defaultDef -and -not [string]::IsNullOrWhiteSpace([string]$defaultDef)) { continue }
-
-        $required += [pscustomobject]@{
-            ColumnName = [string]$r["ColumnName"]
-            TypeName   = [string]$r["TypeName"]
-            MaxLength  = [int]$r["MaxLength"]
-            Precision  = [int]$r["Precision"]
-            Scale      = [int]$r["Scale"]
-        }
-    }
-    return $required
-}
-
-function Get-FallbackValueForType {
-    param(
-        [string]$TypeName
-    )
-
-    switch ($TypeName.ToLowerInvariant()) {
-        "bit" { return 0 }
-        "tinyint" { return 0 }
-        "smallint" { return 0 }
-        "int" { return 0 }
-        "bigint" { return 0 }
-        "decimal" { return 0 }
-        "numeric" { return 0 }
-        "money" { return 0 }
-        "smallmoney" { return 0 }
-        "float" { return 0 }
-        "real" { return 0 }
-        "date" { return (Get-Date).Date }
-        "datetime" { return Get-Date }
-        "datetime2" { return Get-Date }
-        "smalldatetime" { return Get-Date }
-        "time" { return [TimeSpan]::Zero }
-        default { return "" } # strings + anything unknown
-    }
-}
-
-function Build-InsertPlan {
-    param(
-        [System.Data.SqlClient.SqlConnection]$Conn,
-        [int]$VenueIdValue,
-        [string]$StoreNameValue,
-        [Nullable[int]]$StoreGroupValue,
-        [hashtable]$Overrides
-    )
-
-    # Determine required columns in dbo.Store that do NOT have defaults.
-    $required = Get-NonNullableColumnsWithoutDefault -Conn $Conn
-
-    # Always set these explicitly if present in table.
-    $values = @{}
-    $values["VenueID"] = $VenueIdValue
-    $values["Name"]    = $StoreNameValue
-
-    if ($StoreGroupValue -ne $null) {
-        $values["StoreGroup"] = [int]$StoreGroupValue
-    }
-
-    if ($Overrides) {
-        foreach ($k in $Overrides.Keys) {
-            $values[$k] = $Overrides[$k]
-        }
-    }
-
-    # Ensure all required columns have a value.
-    foreach ($col in $required) {
-        $cn = $col.ColumnName
-        if (-not $values.ContainsKey($cn)) {
-            # Provide a safe fallback to satisfy NOT NULL.
-            $values[$cn] = Get-FallbackValueForType -TypeName $col.TypeName
-        }
-    }
-
-    # Ensure we only insert into columns that exist in dbo.Store
-    # (in case overrides include unknown keys)
-    $existingSql = "SELECT c.name FROM sys.columns c WHERE c.object_id = OBJECT_ID('dbo.Store');"
-    $existingDt = Invoke-SqlDataTable -Connection $Conn -Sql $existingSql -Parameters @{}
-    $existing = New-Object 'System.Collections.Generic.HashSet[string]'
-    foreach ($r in $existingDt.Rows) { [void]$existing.Add([string]$r["name"]) }
-
-    $final = @{}
-    foreach ($k in $values.Keys) {
-        if ($existing.Contains($k)) {
-            $final[$k] = $values[$k]
-        }
-    }
-
-    $cols = @($final.Keys) | Sort-Object
-    if ($cols.Count -eq 0) { throw "Insert plan produced no columns. Cannot continue." }
-
-    $colList = ($cols | ForEach-Object { "[" + $_ + "]" }) -join ", "
-    $paramList = ($cols | ForEach-Object { "@" + $_ }) -join ", "
-
-    $sql = "INSERT INTO dbo.Store ($colList) VALUES ($paramList); SELECT CAST(SCOPE_IDENTITY() AS int) AS NewStoreID;"
-    return [pscustomobject]@{
-        Sql = $sql
-        Values = $final
-        Columns = $cols
-        RequiredColumnsWithoutDefaults = $required
-    }
-}
-
-function Confirm-Apply {
-    param([string]$Message)
-
+function Confirm-Apply([string]$Message) {
     if ($Force.IsPresent) { return $true }
-
     if (-not (Test-IsInteractive)) { return $false }
 
     Write-Host ""
     Write-Host $Message
-    Write-Host "Type CREATE to proceed, anything else to cancel: " -NoNewline
+    Write-Host "Type REPAIR to proceed, anything else to cancel: " -NoNewline
     $resp = Read-Host
-    return ($resp -eq "CREATE")
+    return ($resp -eq "REPAIR")
 }
 
-# ----------------------------
-# Main
-# ----------------------------
+function Resolve-ToolkitRoot {
+    param([string]$ProvidedRoot)
+
+    if (-not [string]::IsNullOrWhiteSpace($ProvidedRoot)) {
+        return (Resolve-Path -LiteralPath $ProvidedRoot).Path
+    }
+
+    # Heuristic: tools\<this tool>\run.ps1 -> ToolkitRoot is parent of "tools"
+    $p = (Resolve-Path -LiteralPath $PSScriptRoot).Path
+    $dir = New-Object System.IO.DirectoryInfo($p)
+    while ($dir -ne $null) {
+        if ($dir.Name -ieq "tools") {
+            return $dir.Parent.FullName
+        }
+        $dir = $dir.Parent
+    }
+
+    $default = "C:\Bepoz\OnboardingToolkit"
+    if (Test-Path -LiteralPath $default) { return $default }
+
+    throw "Could not resolve ToolkitRoot. Provide -ToolkitRoot or set BEPOZ_TOOLKIT_ROOT."
+}
+
+function Try-GitPull {
+    param([string]$Root)
+
+    $gitDir = Join-Path $Root ".git"
+    if (-not (Test-Path -LiteralPath $gitDir)) {
+        return @{ attempted = $false; ok = $false; message = "Not a git clone (no .git folder)." }
+    }
+
+    $git = Get-Command git.exe -ErrorAction SilentlyContinue
+    if (-not $git) {
+        return @{ attempted = $false; ok = $false; message = "git.exe not found in PATH." }
+    }
+
+    try {
+        Write-Log INFO "Attempting git pull in $Root ..."
+        $p = Start-Process -FilePath $git.Source -ArgumentList @("-C", $Root, "pull", "--ff-only") -NoNewWindow -Wait -PassThru
+        if ($p.ExitCode -ne 0) {
+            return @{ attempted = $true; ok = $false; message = "git pull failed with exit code $($p.ExitCode)." }
+        }
+        return @{ attempted = $true; ok = $true; message = "git pull completed." }
+    } catch {
+        return @{ attempted = $true; ok = $false; message = "git pull threw: $($_.Exception.Message)" }
+    }
+}
+
+function Try-ToolkitSync {
+    param([string]$Root)
+
+    $toolkitPs1 = Join-Path $Root "Toolkit.ps1"
+    if (-not (Test-Path -LiteralPath $toolkitPs1)) {
+        return @{ attempted = $false; ok = $false; message = "Toolkit.ps1 not found at root." }
+    }
+
+    try {
+        Write-Log INFO "Attempting Toolkit.ps1 -Sync ..."
+        $args = @("-NoProfile","-ExecutionPolicy","Bypass","-File",$toolkitPs1,"-Sync")
+        $p = Start-Process -FilePath "powershell.exe" -ArgumentList $args -NoNewWindow -Wait -PassThru
+        if ($p.ExitCode -ne 0) {
+            return @{ attempted = $true; ok = $false; message = "Toolkit.ps1 -Sync failed with exit code $($p.ExitCode)." }
+        }
+        return @{ attempted = $true; ok = $true; message = "Toolkit.ps1 -Sync completed." }
+    } catch {
+        return @{ attempted = $true; ok = $false; message = "Toolkit.ps1 -Sync threw: $($_.Exception.Message)" }
+    }
+}
+
+function Try-ZipRepair {
+    param(
+        [string]$Root,
+        [string]$ZipUrl,
+        [string]$ToolFolderRelative
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ZipUrl)) {
+        return @{ attempted = $false; ok = $false; message = "RepoZipUrl not provided." }
+    }
+
+    try {
+        $tmp = Join-Path $env:TEMP ("BepozToolkitZip_" + [Guid]::NewGuid().ToString("N"))
+        New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+
+        $zipPath = Join-Path $tmp "repo.zip"
+        Write-Log INFO "Downloading repo ZIP..."
+        Invoke-WebRequest -Uri $ZipUrl -OutFile $zipPath -UseBasicParsing -ErrorAction Stop
+
+        $extract = Join-Path $tmp "extract"
+        New-Item -ItemType Directory -Path $extract -Force | Out-Null
+
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($zipPath, $extract)
+
+        $top = Get-ChildItem -LiteralPath $extract -Directory | Select-Object -First 1
+        if (-not $top) { throw "ZIP extract did not contain a top-level folder." }
+
+        $srcToolPath = Join-Path $top.FullName $ToolFolderRelative
+        if (-not (Test-Path -LiteralPath $srcToolPath)) {
+            throw "Tool folder not found in ZIP at: $ToolFolderRelative"
+        }
+
+        $dstToolPath = Join-Path $Root $ToolFolderRelative
+        if (-not (Test-Path -LiteralPath $dstToolPath)) {
+            New-Item -ItemType Directory -Path $dstToolPath -Force | Out-Null
+        }
+
+        Write-Log INFO "Copying missing tool folder from ZIP..."
+        Copy-Item -Path (Join-Path $srcToolPath "*") -Destination $dstToolPath -Recurse -Force -ErrorAction Stop
+
+        return @{ attempted = $true; ok = $true; message = "ZIP repair copied tool folder successfully." }
+    } catch {
+        return @{ attempted = $true; ok = $false; message = "ZIP repair failed: $($_.Exception.Message)" }
+    } finally {
+        try { if ($tmp -and (Test-Path $tmp)) { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue } } catch {}
+    }
+}
+
 $report = @{
-    toolId     = "store-create-assign-venue"
-    startedAt  = (Get-Date).ToString("o")
-    runDir     = $RunDir
-    inputs     = @{}
-    resolved   = @{}
-    discovery  = @{}
-    checks     = @()
-    actions    = @()
-    result     = @{
-        status = "Unknown"
+    toolId    = "toolkit-sync-verify"
+    startedAt = (Get-Date).ToString("o")
+    runDir    = $RunDir
+    resolved  = @{}
+    checks    = @()
+    repairs   = @()
+    result    = @{
+        status  = "Unknown"
         message = ""
-        storeId = $null
-        database = $null
-        venueId = $null
-        storeName = $null
+        toolId  = $null
+        entryPoint = $null
+        entryPointFullPath = $null
     }
 }
 
 try {
-    Write-Log INFO "Create Store + Assign to Venue starting..."
+    # Marker proves the script actually started in the intended RunDir
+    "started $(Get-Date -Format o)" | Set-Content -LiteralPath $MarkerPath -Encoding UTF8 -Force
 
-    # Resolve config file
+    Write-Log INFO "Toolkit Sync + Verify starting..."
+    Write-Log INFO "Resolved RunDir: $RunDir"
+
     if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
-        $ConfigPath = Join-Path $RunDir "CreateStore.config.json"
+        $ConfigPath = Join-Path $PSScriptRoot "ToolkitSyncVerify.config.json"
     }
     $cfg = Read-JsonFile -Path $ConfigPath
-    if ($cfg) {
-        Write-Log INFO "Loaded config: $ConfigPath"
-    } else {
-        Write-Log INFO "No config loaded (looked for: $ConfigPath)"
+
+    $envRoot  = Get-EnvString "BEPOZ_TOOLKIT_ROOT"
+    $envTool  = Get-EnvString "BEPOZ_VERIFY_TOOLID"
+    $envDry   = Get-EnvBool   "BEPOZ_DRYRUN"
+    $envForce = Get-EnvBool   "BEPOZ_FORCE"
+    $envZip   = Get-EnvString "BEPOZ_REPO_ZIP_URL"
+
+    if ([string]::IsNullOrWhiteSpace($ToolkitRoot)) {
+        if ($cfg -and $cfg.ToolkitRoot) { $ToolkitRoot = [string]$cfg.ToolkitRoot }
+        elseif ($envRoot) { $ToolkitRoot = $envRoot }
     }
 
-    # Environment values
-    $envSqlServer  = Get-EnvString "BEPOZ_SQLSERVER"
-    $envDatabase   = Get-EnvString "BEPOZ_DATABASE"
-    $envVenueId    = Get-EnvInt "BEPOZ_VENUEID"
-    $envStoreName  = Get-EnvString "BEPOZ_STORENAME"
-    $envStoreGroup = Get-EnvInt "BEPOZ_STOREGROUP"
-    $envDryRun     = Get-EnvBool "BEPOZ_DRYRUN"
-    $envForce      = Get-EnvBool "BEPOZ_FORCE"
-
-    # Apply precedence: params > config > env
-    if ([string]::IsNullOrWhiteSpace($SqlServer)) {
-        if ($cfg -and $cfg.SqlServer) { $SqlServer = [string]$cfg.SqlServer }
-        elseif ($envSqlServer) { $SqlServer = $envSqlServer }
-        else { $SqlServer = ".\SQLEXPRESS" } # sensible default for many installs
-    }
-
-    if ([string]::IsNullOrWhiteSpace($Database)) {
-        if ($cfg -and $cfg.Database) { $Database = [string]$cfg.Database }
-        elseif ($envDatabase) { $Database = $envDatabase }
-    }
-
-    if (-not $PSBoundParameters.ContainsKey("VenueId") -or $VenueId -eq 0) {
-        if ($cfg -and $cfg.VenueId) { $VenueId = [int]$cfg.VenueId }
-        elseif ($envVenueId -ne $null) { $VenueId = [int]$envVenueId }
-    }
-
-    if ([string]::IsNullOrWhiteSpace($StoreName)) {
-        if ($cfg -and $cfg.StoreName) { $StoreName = [string]$cfg.StoreName }
-        elseif ($envStoreName) { $StoreName = $envStoreName }
-    }
-
-    if (-not $PSBoundParameters.ContainsKey("StoreGroup")) {
-        if ($cfg -and $cfg.StoreGroup -ne $null) { $StoreGroup = [int]$cfg.StoreGroup }
-        elseif ($envStoreGroup -ne $null) { $StoreGroup = [int]$envStoreGroup }
+    if ([string]::IsNullOrWhiteSpace($ToolId)) {
+        if ($cfg -and $cfg.ToolId) { $ToolId = [string]$cfg.ToolId }
+        elseif ($envTool) { $ToolId = $envTool }
+        else { $ToolId = "store-create-assign-venue" }
     }
 
     if ($DryRun -eq $null) {
         if ($cfg -and $cfg.DryRun -ne $null) { $DryRun = [bool]$cfg.DryRun }
-        elseif ($envDryRun -ne $null) { $DryRun = [bool]$envDryRun }
-        else { $DryRun = $true } # SAFE BY DEFAULT
+        elseif ($envDry -ne $null) { $DryRun = [bool]$envDry }
+        else { $DryRun = $true }
     }
 
     if (-not $Force.IsPresent) {
@@ -446,189 +293,115 @@ try {
         elseif ($envForce -eq $true) { $Force = $true }
     }
 
-    $overrides = $null
-    if ($cfg -and $cfg.StoreOverrides) {
-        $overrides = @{}
-        foreach ($p in $cfg.StoreOverrides.PSObject.Properties) {
-            $overrides[$p.Name] = $p.Value
-        }
+    if ([string]::IsNullOrWhiteSpace($RepoZipUrl)) {
+        if ($cfg -and $cfg.RepoZipUrl) { $RepoZipUrl = [string]$cfg.RepoZipUrl }
+        elseif ($envZip) { $RepoZipUrl = $envZip }
     }
 
-    $report.inputs = @{
+    $ToolkitRoot = Resolve-ToolkitRoot -ProvidedRoot $ToolkitRoot
+
+    $report.resolved = @{
+        toolkitRoot = $ToolkitRoot
+        toolId = $ToolId
+        dryRun = [bool]$DryRun
+        force = [bool]$Force.IsPresent
+        hasRepoZipUrl = -not [string]::IsNullOrWhiteSpace($RepoZipUrl)
         configPath = $ConfigPath
     }
-    $report.resolved = @{
-        sqlServer = $SqlServer
-        database  = $Database
-        venueId   = $VenueId
-        storeName = $StoreName
-        storeGroup = $StoreGroup
-        dryRun    = $DryRun
-        force     = [bool]$Force.IsPresent
-        hasOverrides = [bool]($overrides -ne $null -and $overrides.Count -gt 0)
-    }
 
-    Write-Log INFO "SQL Server: $SqlServer"
+    Write-Log INFO "ToolkitRoot: $ToolkitRoot"
+    Write-Log INFO "ToolId: $ToolId"
     Write-Log INFO ("DryRun: " + $DryRun.ToString() + " (Force: " + ([bool]$Force.IsPresent).ToString() + ")")
 
-    # Auto-discover database if missing
-    if ([string]::IsNullOrWhiteSpace($Database)) {
-        Write-Log WARN "Database not provided. Attempting to discover Bepoz databases (dbo.Venue + dbo.Store)..."
-        $candidates = Find-BepozDatabases -Server $SqlServer
-        $report.discovery = @{
-            candidates = $candidates
-        }
-
-        if ($candidates.Count -eq 0) {
-            throw "Could not discover any databases containing dbo.Venue and dbo.Store. Provide -Database or set BEPOZ_DATABASE."
-        }
-
-        if ($candidates.Count -eq 1) {
-            $Database = $candidates[0]
-            Write-Log INFO "Discovered database: $Database"
-        } else {
-            # Multiple candidates; require selection if interactive, else fail safely.
-            if (Test-IsInteractive) {
-                Write-Host ""
-                Write-Host "Multiple candidate databases found:"
-                for ($i=0; $i -lt $candidates.Count; $i++) {
-                    Write-Host ("[{0}] {1}" -f $i, $candidates[$i])
-                }
-                $idx = Read-Host "Enter the index of the database to use"
-                $n = 0
-                if (-not [int]::TryParse($idx, [ref]$n)) { throw "Invalid index." }
-                if ($n -lt 0 -or $n -ge $candidates.Count) { throw "Index out of range." }
-                $Database = $candidates[$n]
-                Write-Log INFO "Selected database: $Database"
-            } else {
-                throw "Multiple candidate databases found but tool is not interactive. Provide -Database or BEPOZ_DATABASE."
-            }
-        }
+    $manifestPath = Join-Path $ToolkitRoot "manifest.json"
+    if (-not (Test-Path -LiteralPath $manifestPath)) {
+        throw "manifest.json not found at ToolkitRoot: $manifestPath"
     }
 
-    $report.result.database = $Database
+    $manifest = Read-JsonFile -Path $manifestPath
+    if (-not $manifest -or -not $manifest.tools) {
+        throw "manifest.json is missing 'tools' array or could not be parsed."
+    }
 
-    # Connect to target database
-    $conn = New-SqlConnection -Server $SqlServer -Db $Database
-    try {
-        # If VenueId missing, allow interactive selection
-        if ($VenueId -le 0) {
-            if (-not (Test-IsInteractive)) {
-                throw "VenueId not supplied and tool is not interactive. Provide -VenueId or BEPOZ_VENUEID."
-            }
-            $venues = Invoke-SqlDataTable -Connection $conn -Sql "SELECT VenueID, Name, SiteCode FROM dbo.Venue ORDER BY VenueID;" -Parameters @{}
-            if ($venues.Rows.Count -eq 0) { throw "No venues found in dbo.Venue." }
+    $tool = $manifest.tools | Where-Object { $_.toolId -eq $ToolId } | Select-Object -First 1
+    $report.checks += @{ name = "ToolExistsInManifest"; ok = [bool]$tool }
+    if (-not $tool) {
+        $report.result.status = "Error"
+        $report.result.message = "ToolId '$ToolId' not found in manifest.json."
+        Write-Log ERROR $report.result.message
+        return
+    }
 
-            Write-Host ""
-            Write-Host "Select a VenueID:"
-            foreach ($r in $venues.Rows) {
-                $vid = $r["VenueID"]
-                $vn  = $r["Name"]
-                $sc  = $r["SiteCode"]
-                Write-Host ("  {0}  -  {1}  (SiteCode: {2})" -f $vid, $vn, $sc)
-            }
-            $vIn = Read-Host "Enter VenueID"
-            $tmp = 0
-            if (-not [int]::TryParse($vIn, [ref]$tmp)) { throw "Invalid VenueID." }
-            $VenueId = $tmp
-            Write-Log INFO "Selected VenueID: $VenueId"
-        }
+    $entryPoint = [string]$tool.entryPoint
+    $report.result.toolId = $ToolId
+    $report.result.entryPoint = $entryPoint
 
-        # If StoreName missing, allow interactive prompt
-        if ([string]::IsNullOrWhiteSpace($StoreName)) {
-            if (-not (Test-IsInteractive)) {
-                throw "StoreName not supplied and tool is not interactive. Provide -StoreName or BEPOZ_STORENAME."
-            }
-            $StoreName = Read-Host "Enter new Store Name"
-            if ([string]::IsNullOrWhiteSpace($StoreName)) { throw "StoreName cannot be empty." }
-        }
+    if ([string]::IsNullOrWhiteSpace($entryPoint)) {
+        throw "Tool '$ToolId' has an empty entryPoint in manifest.json."
+    }
 
-        $report.result.venueId = $VenueId
-        $report.result.storeName = $StoreName
+    $entryFull = Join-Path $ToolkitRoot $entryPoint
+    $report.result.entryPointFullPath = $entryFull
 
-        # Validate venue exists
-        $venueExists = Invoke-SqlScalar -Connection $conn -Sql "SELECT CASE WHEN EXISTS (SELECT 1 FROM dbo.Venue WHERE VenueID=@VenueId) THEN 1 ELSE 0 END;" -Parameters @{ VenueId = $VenueId }
-        $report.checks += @{
-            name = "VenueExists"
-            venueId = $VenueId
-            ok = ([int]$venueExists -eq 1)
-        }
-        if ([int]$venueExists -ne 1) {
-            throw "VenueID $VenueId does not exist in dbo.Venue."
-        }
+    $exists = Test-Path -LiteralPath $entryFull
+    $report.checks += @{
+        name = "EntryPointExistsOnDisk"
+        entryPoint = $entryPoint
+        fullPath = $entryFull
+        ok = [bool]$exists
+    }
 
-        # Check if store name already exists for that venue
-        $existingStoreId = Invoke-SqlScalar -Connection $conn -Sql "SELECT TOP 1 StoreID FROM dbo.Store WHERE VenueID=@VenueId AND Name=@Name ORDER BY StoreID;" -Parameters @{ VenueId = $VenueId; Name = $StoreName }
-        $report.checks += @{
-            name = "StoreNameUniqueWithinVenue"
-            ok = ($null -eq $existingStoreId -or $existingStoreId -eq [DBNull]::Value)
-            existingStoreId = $existingStoreId
-        }
-        if ($existingStoreId -ne $null -and $existingStoreId -ne [DBNull]::Value) {
-            throw "A store named '$StoreName' already exists for VenueID $VenueId (StoreID: $existingStoreId)."
-        }
+    if ($exists) {
+        $report.result.status = "Success"
+        $report.result.message = "EntryPoint exists on disk."
+        Write-Log INFO $report.result.message
+        return
+    }
 
-        # Build insert plan (handles NOT NULL columns without defaults)
-        $plan = Build-InsertPlan -Conn $conn -VenueIdValue $VenueId -StoreNameValue $StoreName -StoreGroupValue ($(if ($PSBoundParameters.ContainsKey("StoreGroup")) { [Nullable[int]]$StoreGroup } else { $null })) -Overrides $overrides
+    Write-Log WARN "EntryPoint is missing on disk: $entryFull"
 
-        $report.actions += @{
-            name = "InsertPlan"
-            dryRun = [bool]$DryRun
-            columns = $plan.Columns
-            usedOverrides = $overrides
-            requiredColumnsWithoutDefaults = @($plan.RequiredColumnsWithoutDefaults | ForEach-Object { $_.ColumnName })
-            sql = $plan.Sql
-        }
+    if ($DryRun) {
+        $report.result.status = "Missing"
+        $report.result.message = "Missing entryPoint. DryRun enabled; no repair attempted."
+        Write-Log WARN $report.result.message
+        Write-Log INFO "Re-run with -DryRun:`$false (and -Force for non-interactive) to attempt repair."
+        return
+    }
 
-        Write-Log INFO "Planned INSERT columns: $($plan.Columns -join ', ')"
-        if ($DryRun) {
-            Write-Log WARN "DryRun is enabled. No changes will be made."
-            $report.result.status = "DryRun"
-            $report.result.message = "DryRun only. Re-run with -DryRun:\$false and confirm to create."
-            return
-        }
+    $okToRepair = Confirm-Apply -Message "Repair will try to sync/pull and/or copy files. Proceed?"
+    if (-not $okToRepair) {
+        $report.result.status = "Cancelled"
+        $report.result.message = "Repair not confirmed (or non-interactive without -Force)."
+        Write-Log WARN $report.result.message
+        return
+    }
 
-        # Confirm apply (unless -Force)
-        $ok = Confirm-Apply -Message "This will CREATE a new store '$StoreName' for VenueID $VenueId in database '$Database'."
-        if (-not $ok) {
-            $report.result.status = "Cancelled"
-            $report.result.message = "User did not confirm CREATE (or Force not provided in non-interactive mode)."
-            Write-Log WARN $report.result.message
-            return
-        }
+    $toolFolderRel = Split-Path -Path $entryPoint -Parent
 
-        # Execute insert within a transaction
-        $tx = $conn.BeginTransaction()
-        try {
-            $cmd = $conn.CreateCommand()
-            $cmd.Transaction = $tx
-            $cmd.CommandText = $plan.Sql
-            $cmd.CommandTimeout = 30
+    $repair1 = Try-GitPull -Root $ToolkitRoot
+    $report.repairs += @{ name="gitPull"; details=$repair1 }
 
-            foreach ($col in $plan.Columns) {
-                $p = $cmd.Parameters.Add("@$col", [System.Data.SqlDbType]::Variant)
-                $p.Value = $plan.Values[$col]
-            }
+    if (-not (Test-Path -LiteralPath $entryFull)) {
+        $repair2 = Try-ToolkitSync -Root $ToolkitRoot
+        $report.repairs += @{ name="toolkitSync"; details=$repair2 }
+    }
 
-            $newId = $cmd.ExecuteScalar()
-            if ($newId -eq $null -or $newId -eq [DBNull]::Value) {
-                throw "Insert succeeded but did not return a new StoreID."
-            }
+    if (-not (Test-Path -LiteralPath $entryFull)) {
+        $repair3 = Try-ZipRepair -Root $ToolkitRoot -ZipUrl $RepoZipUrl -ToolFolderRelative $toolFolderRel
+        $report.repairs += @{ name="zipRepair"; details=$repair3 }
+    }
 
-            $tx.Commit()
+    $existsAfter = Test-Path -LiteralPath $entryFull
+    $report.checks += @{ name = "EntryPointExistsAfterRepair"; ok = [bool]$existsAfter }
 
-            $report.result.status = "Success"
-            $report.result.message = "Created StoreID $newId for VenueID $VenueId."
-            $report.result.storeId = [int]$newId
-
-            Write-Log INFO $report.result.message
-        } catch {
-            try { $tx.Rollback() } catch {}
-            throw
-        }
-    } finally {
-        $conn.Close()
-        $conn.Dispose()
+    if ($existsAfter) {
+        $report.result.status = "Success"
+        $report.result.message = "EntryPoint is now present after repair."
+        Write-Log INFO $report.result.message
+    } else {
+        $report.result.status = "Error"
+        $report.result.message = "EntryPoint still missing after repair attempts."
+        Write-Log ERROR $report.result.message
     }
 
 } catch {
@@ -640,7 +413,4 @@ try {
     Save-Report -Report $report
 }
 
-# Exit codes:
-# 0 = success or dryrun/cancelled (toolkit-friendly)
-# 1 = error
 if ($report.result.status -eq "Error") { exit 1 } else { exit 0 }

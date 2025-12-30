@@ -1,0 +1,13 @@
+{
+  "SqlServer": ".\\SQLEXPRESS",
+  "Database": "BepozVenueDbNameHere",
+  "VenueId": 1,
+  "StoreName": "New Store",
+  "StoreGroup": 0,
+  "DryRun": true,
+  "Force": false,
+  "StoreOverrides": {
+    "ProductsOK": 0,
+    "RedeemPercent": 0
+  }
+}

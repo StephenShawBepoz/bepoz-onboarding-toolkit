@@ -4,7 +4,7 @@ Bepoz Onboarding Toolkit - Toolkit.ps1
 - Downloads missing tool files on-demand (raw GitHub URLs)
 - Runs tools with a per-run RunDir (Output.log + ToolkitContext.json + ToolkitRun.json)
 - Shares SQL context (HKCU:\Software\BackOffice -> SQL_Server, SQL_DSN) with every tool run:
-    - Env vars: BEPOZ_SQL_SERVER, BEPOZ_SQL_DSN, BEPOZ_SQL_REGPATH
+    - Env vars: BEPOZ_SQL_SERVER, BEPOZ_SQL_DSN, BEPOZ_SQL_DATABASE, BEPOZ_SQL_REGPATH
     - File:     <RunDir>\ToolkitContext.json
 - WinForms UI with Output Log viewer (tails Output.log)
 #>
@@ -75,19 +75,105 @@ function Get-BackOfficeSqlSettings {
   return [pscustomobject]$r
 }
 
+function Get-OdbcDsnSqlSettings {
+  <#
+    Attempts to resolve an ODBC DSN (name from BackOffice SQL_DSN) to its SQL Server + Database.
+    Searches 64-bit and 32-bit registry locations for both HKCU and HKLM.
+  #>
+  param([Parameter(Mandatory=$true)][string]$DsnName)
+
+  $r = [ordered]@{
+    dsnName     = $DsnName
+    registryPath= $null
+    server      = $null
+    database    = $null
+    driver      = $null
+    ok          = $false
+    warnings    = @()
+  }
+
+  if ([string]::IsNullOrWhiteSpace($DsnName)) {
+    $r.warnings += "DSN name is blank."
+    return [pscustomobject]$r
+  }
+
+  $candidates = @(
+    "HKCU:\Software\ODBC\ODBC.INI\$DsnName",
+    "HKLM:\Software\ODBC\ODBC.INI\$DsnName",
+    "HKCU:\Software\WOW6432Node\ODBC\ODBC.INI\$DsnName",
+    "HKLM:\Software\WOW6432Node\ODBC\ODBC.INI\$DsnName"
+  )
+
+  foreach ($path in $candidates) {
+    try {
+      $p = Get-ItemProperty -Path $path -ErrorAction Stop
+
+      # Common field names across drivers
+      $srv = $p.Server
+      if (-not $srv) { $srv = $p.ServerName }
+      if (-not $srv) { $srv = $p.Address }
+
+      $db = $p.Database
+      if (-not $db) { $db = $p.InitialCatalog }
+      if (-not $db) { $db = $p.DefaultDatabase }
+
+      $drv = $p.Driver
+
+      if ($srv -or $db -or $drv) {
+        $r.registryPath = $path
+        if ($srv) { $r.server = [string]$srv }
+        if ($db)  { $r.database = [string]$db }
+        if ($drv) { $r.driver = [string]$drv }
+        break
+      }
+    } catch {
+      # keep looking
+    }
+  }
+
+  if (-not $r.registryPath) {
+    $r.warnings += "ODBC DSN '$DsnName' was not found in HKCU/HKLM (32/64-bit) registry locations."
+  }
+  if ([string]::IsNullOrWhiteSpace([string]$r.server))   { $r.warnings += "Server was not found for DSN '$DsnName'." }
+  if ([string]::IsNullOrWhiteSpace([string]$r.database)) { $r.warnings += "Database was not found for DSN '$DsnName'." }
+
+  $r.ok = ($r.warnings.Count -eq 0)
+  return [pscustomobject]$r
+}
+
+
+
 function New-ToolkitContext {
-  $sql = Get-BackOfficeSqlSettings
+  $sql  = Get-BackOfficeSqlSettings
+  $odbc = $null
+
+  if (-not [string]::IsNullOrWhiteSpace([string]$sql.dsn)) {
+    $odbc = Get-OdbcDsnSqlSettings -DsnName ([string]$sql.dsn)
+  } else {
+    $odbc = [pscustomobject]@{
+      dsnName = $null; registryPath=$null; server=$null; database=$null; driver=$null; ok=$false; warnings=@("SQL_DSN is blank; cannot resolve DSN settings.")
+    }
+  }
+
+  # Prefer explicit SQL_Server, but fall back to DSN server if needed
+  $server = if (-not [string]::IsNullOrWhiteSpace([string]$sql.server)) { [string]$sql.server } else { [string]$odbc.server }
+  $dbName = [string]$odbc.database
 
   [pscustomobject]([ordered]@{
-    schemaVersion = 1
+    schemaVersion = 2
     checkedAt     = (Get-Date).ToString("o")
     backOffice    = @{
       registryPath = $sql.registryPath
       sql          = @{
-        dsn      = $sql.dsn
-        server   = $sql.server
-        ok       = [bool]$sql.ok
-        warnings = @($sql.warnings)
+        dsnName   = $sql.dsn
+        server    = $server
+        database  = $dbName
+        ok        = [bool]($sql.ok -and $odbc.ok)
+        warnings  = @($sql.warnings + $odbc.warnings)
+        dsn       = @{
+          registryPath = $odbc.registryPath
+          driver       = $odbc.driver
+        }
       }
     }
   })
@@ -97,13 +183,29 @@ function Set-ToolkitSqlEnvironment {
   param([object]$Context)
 
   if (-not $Context) { return }
+
+  # Registry path (so tools can explain where the values came from)
   $env:BEPOZ_SQL_REGPATH = [string]$Context.backOffice.registryPath
 
-  $dsn = [string]$Context.backOffice.sql.dsn
-  if (-not [string]::IsNullOrWhiteSpace($dsn)) { $env:BEPOZ_SQL_DSN = $dsn }
+  # DSN name
+  $dsn = [string]$Context.backOffice.sql.dsnName
+  if (-not [string]::IsNullOrWhiteSpace($dsn)) {
+    $env:BEPOZ_SQL_DSN = $dsn
+  }
 
+  # Server (instance)
   $srv = [string]$Context.backOffice.sql.server
-  if (-not [string]::IsNullOrWhiteSpace($srv)) { $env:BEPOZ_SQL_SERVER = $srv }
+  if (-not [string]::IsNullOrWhiteSpace($srv)) {
+    $env:BEPOZ_SQL_SERVER = $srv
+  }
+
+  # Database (if resolvable via DSN)
+  $db = [string]$Context.backOffice.sql.database
+  if (-not [string]::IsNullOrWhiteSpace($db)) {
+    $env:BEPOZ_SQL_DATABASE = $db
+    # Backwards/compat helpers some tools may use
+    $env:BEPOZ_DATABASE = $db
+  }
 }
 
 function Write-ToolkitContextFile {
@@ -165,9 +267,9 @@ function Get-Tool([object]$manifest, [string]$toolId) {
   return $t
 }
 
-function Ensure-ToolInstalled([object]$tool) {
-  # IMPORTANT: This function MUST download missing tool files (raw GitHub),
-  # not merely check for them.
+function Ensure-ToolInstalled {
+  param([object]$tool)
+
   $entry = [string]$tool.entryPoint
   if (-not $entry) { throw "Tool '$($tool.toolId)' missing entryPoint in manifest." }
 
@@ -178,15 +280,68 @@ function Ensure-ToolInstalled([object]$tool) {
     $files += $entry
   }
 
+  # Tool folder derived from entryPoint (more robust than assuming toolId matches folder)
+  $entryLocalPath = Join-Path $Root ($entry -replace "/","\")
+  $toolFolder = Split-Path -Parent $entryLocalPath
+  if (-not $toolFolder) { throw "Cannot determine tool folder for entryPoint: $entry" }
+
+  $metaPath = Join-Path $toolFolder ".toolmeta.json"
+  $manifestVersion = [string]$tool.toolVersion
+
+  $force = $false
+  if ($env:BEPOZ_TOOLKIT_FORCE_TOOL_UPDATE -eq "1") { $force = $true }
+
+  if (-not $force -and (Test-Path -LiteralPath $metaPath)) {
+    try {
+      $meta = Get-Content -LiteralPath $metaPath -Raw -Encoding UTF8 | ConvertFrom-Json
+      if ($manifestVersion -and $meta.toolVersion -ne $manifestVersion) {
+        $force = $true
+      }
+    
+
+  # First run after upgrading the Toolkit: if a tool already exists but has no meta file, refresh once.
+  if (-not $force -and $manifestVersion -and -not (Test-Path -LiteralPath $metaPath) -and (Test-Path -LiteralPath $toolFolder)) {
+    $force = $true
+  }
+} catch {
+      $force = $true
+    }
+  }
+
+  if ($force -and (Test-Path -LiteralPath $toolFolder)) {
+    Write-Log "Tool update required - removing cached folder: $toolFolder"
+    try { Remove-Item -LiteralPath $toolFolder -Recurse -Force -ErrorAction Stop } catch {}
+  }
+
   foreach ($rel in $files) {
     $rel = ([string]$rel) -replace "\\","/"         # raw URLs expect /
     $dest = Join-Path $Root ($rel -replace "/","\") # local path
-    if (-not (Test-Path -LiteralPath $dest)) {
-      $url = "https://raw.githubusercontent.com/$RepoOwner/$RepoName/$Branch/$rel"
-      Write-Log "Downloading tool file: $rel"
+
+    $dir = Split-Path -Parent $dest
+    if ($dir) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+
+    if ($force -or -not (Test-Path -LiteralPath $dest)) {
+      # Cache-bust to avoid stale CDN responses
+      $v = if ($manifestVersion) { $manifestVersion } else { (Get-Date).ToUniversalTime().Ticks }
+      $url = "https://raw.githubusercontent.com/$RepoOwner/$RepoName/$Branch/$rel?v=$v"
+      Write-Log "Downloading tool file: $rel (force=$force)"
       Download-File -url $url -outFile $dest
     }
   }
+
+  # Write metadata (so toolVersion bumps cause refresh)
+  try {
+    New-Item -ItemType Directory -Force -Path $toolFolder | Out-Null
+    $metaObj = [pscustomobject]@{
+      toolId      = [string]$tool.toolId
+      toolVersion = $manifestVersion
+      entryPoint  = $entry
+      downloadedAtUtc = (Get-Date).ToUniversalTime().ToString("o")
+      repo        = "$RepoOwner/$RepoName"
+      branch      = $Branch
+    }
+    ($metaObj | ConvertTo-Json -Depth 6) | Set-Content -LiteralPath $metaPath -Encoding UTF8
+  } catch {}
 }
 
 function New-RunDir([string]$toolId) {
@@ -219,10 +374,11 @@ try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::
 
 `$runDir = '$runDir'
 `$outLog = '$outLog'
-`$env:BEPoz_TOOLKIT_RUNDIR = `$runDir
+`$env:BEPOZ_TOOLKIT_RUNDIR = `$runDir
 
 Write-Host "SQL_Server:  `$env:BEPOZ_SQL_SERVER"
 Write-Host "SQL_DSN:     `$env:BEPOZ_SQL_DSN"
+Write-Host "SQL_DB:      `$env:BEPOZ_SQL_DATABASE"
 Write-Host "Context:     $ctxPath"
 Write-Host "EntryPoint:  $entryRel"
 Write-Host "RunDir:      `$runDir"
@@ -253,8 +409,9 @@ try {
 
   # Pass SQL env vars into the child process explicitly
   $sql = $Global:ToolkitContext.backOffice.sql
-  if ($sql -and $sql.dsn)    { $psi.EnvironmentVariables["BEPOZ_SQL_DSN"]    = [string]$sql.dsn }
-  if ($sql -and $sql.server) { $psi.EnvironmentVariables["BEPOZ_SQL_SERVER"] = [string]$sql.server }
+  if ($sql -and $sql.dsnName)  { $psi.EnvironmentVariables["BEPOZ_SQL_DSN"]      = [string]$sql.dsnName }
+  if ($sql -and $sql.server)   { $psi.EnvironmentVariables["BEPOZ_SQL_SERVER"]   = [string]$sql.server }
+  if ($sql -and $sql.database) { $psi.EnvironmentVariables["BEPOZ_SQL_DATABASE"] = [string]$sql.database; $psi.EnvironmentVariables["BEPOZ_DATABASE"] = [string]$sql.database }
   $psi.EnvironmentVariables["BEPOZ_SQL_REGPATH"] = [string]$Global:ToolkitContext.backOffice.registryPath
 
   $p = [System.Diagnostics.Process]::Start($psi)
@@ -365,7 +522,7 @@ function Show-Ui {
 
   $sql = $Global:ToolkitContext.backOffice.sql
   if ($sql.ok) {
-    $lblSql.Text = "SQL: {0}   DB: {1}   (from {2})" -f $sql.server, $sql.dsn, $Global:ToolkitContext.backOffice.registryPath
+    $lblSql.Text = "SQL: {0}   DB: {1}   DSN: {2}   (from {3})" -f $sql.server, ($(if ([string]::IsNullOrWhiteSpace([string]$sql.database)) { "<unknown>" } else { [string]$sql.database })), $sql.dsnName, $Global:ToolkitContext.backOffice.registryPath
   } else {
     $lblSql.Text = "SQL settings missing/incomplete (HKCU:\Software\BackOffice). Tools may fail to connect."
   }
@@ -396,7 +553,32 @@ function Show-Ui {
   $infoBox.ReadOnly = $true
   $infoBox.ScrollBars = "Vertical"
   $infoBox.Dock = "Fill"
-  $infoBox.Text = "Tools root: $Root`r`nRuns: $RunsDir`r`n`r`nSQL context:`r`n  BEPOZ_SQL_SERVER=$env:BEPOZ_SQL_SERVER`r`n  BEPOZ_SQL_DSN=$env:BEPOZ_SQL_DSN`r`n  BEPOZ_SQL_REGPATH=$env:BEPOZ_SQL_REGPATH"
+  $infoBox.Text = @"
+Tools root:
+  $Root
+
+Runs:
+  $RunsDir
+
+SQL context (auto-detected for the CURRENT Windows user):
+  Registry:   $env:BEPOZ_SQL_REGPATH
+  SQL Server: $env:BEPOZ_SQL_SERVER
+  DSN name:   $env:BEPOZ_SQL_DSN
+  Database:   $env:BEPOZ_SQL_DATABASE
+
+How the Toolkit finds SQL settings:
+  1) HKCU\Software\BackOffice values:
+       - SQL_Server  (SQL Server instance)
+       - SQL_DSN     (ODBC DSN name)
+  2) If SQL_DSN is present, the Toolkit looks up the DSN in ODBC registry keys (HKCU/HKLM, 32/64-bit)
+     to resolve the Database and (if needed) the Server.
+
+If SQL values are missing:
+  - Make sure Back Office has been launched at least once as this user.
+  - Check the registry key above contains SQL_Server and SQL_DSN.
+  - Check the DSN exists in "ODBC Data Sources" (both 64-bit and 32-bit if unsure), and that it points to
+    the correct Server and Database.
+"@
   $tabInfo.Controls.Add($infoBox)
 
   $tabs.TabPages.Add($tabOut) | Out-Null
@@ -512,7 +694,7 @@ function Show-Ui {
   })
 
   if (-not $sql.ok) {
-    $warn = "BackOffice SQL settings were not found or are incomplete.`r`n`r`nExpected in HKCU:\Software\BackOffice:`r`n  SQL_Server  (server\instance)`r`n  SQL_DSN     (database name)`r`n`r`nTools that query SQL may fail until these are set."
+    $warn = "BackOffice SQL settings were not found or are incomplete for this Windows user.`r`n`r`nToolkit reads:`r`n  HKCU\Software\BackOffice (values SQL_Server and SQL_DSN)`r`n`r`nFix options:`r`n  1) Launch Back Office once as this user (often re-creates the registry values).`r`n  2) Open ODBC Data Sources and confirm the DSN exists and points to the correct Server/Database.`r`n  3) As a last resort, set SQL_Server and SQL_DSN under HKCU\Software\BackOffice manually.`r`n`r`nTools that query SQL may fail until these are set."
     [System.Windows.Forms.MessageBox]::Show($warn, "Bepoz Toolkit - SQL settings", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
   }
 
